@@ -1,7 +1,9 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
-- 30nov25: Correctie in de logica (Grok)
+- 14jul26: Hysterese (aan bij dT>3.0, uit pas bij dT<1.0) + minimale looptijd (4') + PWM-ramp (max 40/min) toegevoegd in solarPump() om abrupt aan/uit schakelen en PWM-sprongen te voorkomen (Claude)
+- 26dec25: Correctie in de logica (Grok) + 2e correctie! (pump function)
+- 3dec25: Correctie in de logica (Grok)
 - 26nov25: Correctie in de initialisatie van enkele variabelen (Grok)
 - 25nov25: Correctie in de solarPump() functie!
 - 24nov25: Corrigeerde met Grok: 1) Fout voor PT1000 temperature MAX31865 printje (in geval het vriest). 2) Nieuwe logica in solarPump() functie
@@ -53,8 +55,6 @@ PhotoniX shield v.4.0	I/O connections: (* = used)
 *A7 - OP2 (= pwmPin)
  TX/RX - Serial comms
 ---------------------------------------
-
-To do:
 -
 */
 
@@ -126,6 +126,13 @@ double dT = Tsun - Tboil;
 double Hysteresis = 1;
 double pwmValue = 0; // 0-255 (Use double to calculate)
 int consecutiveReductions = 0;  // Initialize counter for consecutive energy reductions (dEQ<=0)
+
+// Toegevoegd 14jul26: Hysterese, minimale looptijd en PWM-ramp (voorkomt abrupt schakelen)
+double DT_UIT = 1.0;            // drempel om pomp te stoppen (lager dan 3.0 = hysterese)
+double PWM_MIN_RUN = 80;        // minimale PWM zodra de pomp draait
+double PWM_RAMP_STEP = 40;      // max. PWM-verandering per solarPump()-aanroep (1x/minuut)
+unsigned long pumpStartTime = 0;
+const unsigned long MIN_RUNTIME = 4 * 60 * 1000; // minimaal 4 minuten laten draaien
 
 // Define timer to call solarPump function
 const unsigned long pumpInterval = 1 * 60 * 1000;
@@ -312,76 +319,93 @@ float mapRange(float value, float inputMin, float inputMax, float outputMin, flo
 
 
 
-// Control solar pump speed (PWM value) and ON/OFF state – VERSIE 30-11-2025 17:42
+
+
+// Control solar pump speed (PWM value) and ON/OFF state – Hysterese + PWM-ramp, 14jul26
 void solarPump() {
-  // 1. Nachtblokkering 07-21u
+  // Nachtblokkering
   if (Hour < 7 || Hour >= 21) {
     digitalWrite(relayPin, HIGH);
-    relayState = false;
-    relay = 0;
-    pwmValue = 0;
+    relayState = false; relay = 0; pwmValue = 0;
     sprintf(str, "Pump OFF - Nachtblokkering");
     analogWrite(pwmPin, 0);
     consecutiveReductions = 0;
     return;
   }
 
-  // 2. Basis aan-conditie
-  bool shouldBeOn = (dT > 3.0);
+  // Hysterese: aan boven 3.0, maar pas uit onder DT_UIT (was: dezelfde drempel voor aan/uit)
+  bool shouldBeOn = relayState ? (dT > DT_UIT) : (dT > 3.0);
 
-  // 3. Thermosifon voorkomen
+  // Thermosifon blokkeren
   if (dT > 3.0 && Tsun < 22.0) {
     shouldBeOn = false;
     sprintf(str, "Pump OFF - Thermosifon (Tsun=%.1fC)", Tsun);
   }
 
-  // 4. Verlies-streak – 100 % IDENTIEK AAN GOOGLE SHEETS
-  if (dEQ <= 0.0) {
-    consecutiveReductions++;
-    if (consecutiveReductions >= 3) {
-      shouldBeOn = false;
+  // Verlies-streak alleen als niet geblokkeerd door thermosifon
+  if (shouldBeOn) {
+    if (dEQ > 0.0) {
+      consecutiveReductions = 0;
+    } else if (dEQ <= 0.0) {
+      consecutiveReductions++;
+      if (consecutiveReductions >= 3) {
+        shouldBeOn = false;
+      }
     }
-  } else {
-    consecutiveReductions = 0;        // ← DIT WAS DE HELE TIJD DE MISSENDE REGEL
   }
 
-  // 5. Oververhitting heeft altijd voorrang
-  if (Tsun >= 90.0) {
+  // Minimale looptijd: negeer een OFF-verzoek zolang de pomp nog niet lang genoeg draait
+  if (!shouldBeOn && relayState && (millis() - pumpStartTime < MIN_RUNTIME)) {
     shouldBeOn = true;
-    pwmValue = 255;
+  }
+
+  // Oververhitting: forceert AAN + PWM direct naar max (bewust geen ramp, veiligheid > geleidelijkheid)
+  bool overheat = (Tsun >= 90.0);
+  if (overheat) {
+    shouldBeOn = true;
     sprintf(str, "Pump MAX - Collector >= 90C");
   }
 
-  // 6. Definitieve aan/uit + PWM
+  float pwmDoel = 0;
+
   if (shouldBeOn) {
     if (!relayState) {
       sprintf(str, "Pump STARTED - dT=%.1fC", dT);
       consecutiveReductions = 0;
+      pumpStartTime = millis();
     }
     digitalWrite(relayPin, LOW);
-    relayState = true;
-    relay = 1;
+    relayState = true; relay = 1;
 
-    if (Tsun < 90.0) {
-      if (Tsun > 75.0) {
-        pwmValue = 180;
-      } else {
-        float delta = constrain(dT - 3.0, 0.0, 17.0);
-        pwmValue = 80 + (uint16_t)(delta * 120.0 / 17.0 + 0.5);
-      }
+    if (overheat) {
+      pwmDoel = 255;
+    } else if (Tsun > 75.0) {
+      pwmDoel = 180;
+    } else {
+      float delta = constrain(dT - 3.0, 0.0, 17.0);
+      pwmDoel = PWM_MIN_RUN + (delta * (200.0 - PWM_MIN_RUN) / 17.0);
     }
-    sprintf(str, "Pump ON - dT=%.1f Tsun=%.1f PWM=%d", dT, Tsun, (int)pwmValue);
   } else {
-    if (relayState) {
-      sprintf(str, "Pump OFF - geen zon of verlies-streak");
-    }
+    if (relayState) sprintf(str, "Pump OFF - geen zon of verlies-streak");
     digitalWrite(relayPin, HIGH);
-    relayState = false;
-    relay = 0;
-    pwmValue = 0;
+    relayState = false; relay = 0;
+    pwmDoel = 0;
   }
 
-  analogWrite(pwmPin, pwmValue);
+  // PWM geleidelijk naar het doel laten bewegen, behalve bij oververhitting
+  if (overheat) {
+    pwmValue = pwmDoel;
+  } else if (pwmValue < pwmDoel) {
+    pwmValue = min(pwmValue + PWM_RAMP_STEP, pwmDoel);
+  } else if (pwmValue > pwmDoel) {
+    pwmValue = max(pwmValue - PWM_RAMP_STEP, pwmDoel);
+  }
+
+  if (relayState) {
+    sprintf(str, "Pump ON - dT=%.1f Tsun=%.1f PWM=%d", dT, Tsun, (int)pwmValue);
+  }
+
+  analogWrite(pwmPin, (int)pwmValue);
 }
 
 
