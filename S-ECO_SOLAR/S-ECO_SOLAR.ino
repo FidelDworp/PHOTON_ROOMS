@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 14jul26b: solarPump() omgebouwd naar PID-regeling (DT_TARGET=2.5°C) i.p.v. drempel+ramp; lost de blijvende 9-minuten aan/uit-cyclus op door de PWM continu naar een evenwicht te laten zoeken i.p.v. te forceren met een minimale looptijd (Claude)
 - 14jul26: Hysterese (aan bij dT>3.0, uit pas bij dT<1.0) + minimale looptijd (4') + PWM-ramp (max 40/min) toegevoegd in solarPump() om abrupt aan/uit schakelen en PWM-sprongen te voorkomen (Claude)
 - 26dec25: Correctie in de logica (Grok) + 2e correctie! (pump function)
 - 3dec25: Correctie in de logica (Grok)
@@ -127,12 +128,20 @@ double Hysteresis = 1;
 double pwmValue = 0; // 0-255 (Use double to calculate)
 int consecutiveReductions = 0;  // Initialize counter for consecutive energy reductions (dEQ<=0)
 
-// Toegevoegd 14jul26: Hysterese, minimale looptijd en PWM-ramp (voorkomt abrupt schakelen)
-double DT_UIT = 1.0;            // drempel om pomp te stoppen (lager dan 3.0 = hysterese)
-double PWM_MIN_RUN = 80;        // minimale PWM zodra de pomp draait
-double PWM_RAMP_STEP = 40;      // max. PWM-verandering per solarPump()-aanroep (1x/minuut)
+// PID-regelaar voor pompsnelheid (vervangt drempel+ramp), 14jul26b
+double DT_TARGET = 2.5;          // gewenste dT-evenwicht i.p.v. aan/uit-cyclus
+double DT_START  = 3.0;          // drempel om de pomp te starten vanuit stilstand
+double DT_STOP   = 0.5;          // drempel om de pomp volledig te stoppen (relay uit)
+double Kp = 8.0;
+double Ki = 0.6;
+double Kd = 3.0;
+double pidIntegral = 0;
+double pidPrevError = 0;
+const double PID_I_MAX = 50.0;   // anti-windup clamp op de integraalterm
+double PWM_MIN_RUN = 60;         // ondergrens PWM zolang de pomp draait
+double PWM_RAMP_STEP = 25;       // extra veiligheidslimiet: max PWM-verandering per minuut, bovenop de PID
 unsigned long pumpStartTime = 0;
-const unsigned long MIN_RUNTIME = 4 * 60 * 1000; // minimaal 4 minuten laten draaien
+unsigned long lastPidTime = 0;
 
 // Define timer to call solarPump function
 const unsigned long pumpInterval = 1 * 60 * 1000;
@@ -321,7 +330,7 @@ float mapRange(float value, float inputMin, float inputMax, float outputMin, flo
 
 
 
-// Control solar pump speed (PWM value) and ON/OFF state – Hysterese + PWM-ramp, 14jul26
+// Control solar pump speed (PWM value) and ON/OFF state – PID-regelaar, 14jul26b
 void solarPump() {
   // Nachtblokkering
   if (Hour < 7 || Hour >= 21) {
@@ -330,14 +339,15 @@ void solarPump() {
     sprintf(str, "Pump OFF - Nachtblokkering");
     analogWrite(pwmPin, 0);
     consecutiveReductions = 0;
+    pidIntegral = 0; pidPrevError = 0;
     return;
   }
 
-  // Hysterese: aan boven 3.0, maar pas uit onder DT_UIT (was: dezelfde drempel voor aan/uit)
-  bool shouldBeOn = relayState ? (dT > DT_UIT) : (dT > 3.0);
+  // Hysterese voor de relay zelf: start bij DT_START, stop pas bij DT_STOP (PID regelt de snelheid ertussenin)
+  bool shouldBeOn = relayState ? (dT > DT_STOP) : (dT > DT_START);
 
   // Thermosifon blokkeren
-  if (dT > 3.0 && Tsun < 22.0) {
+  if (dT > DT_START && Tsun < 22.0) {
     shouldBeOn = false;
     sprintf(str, "Pump OFF - Thermosifon (Tsun=%.1fC)", Tsun);
   }
@@ -354,57 +364,68 @@ void solarPump() {
     }
   }
 
-  // Minimale looptijd: negeer een OFF-verzoek zolang de pomp nog niet lang genoeg draait
-  if (!shouldBeOn && relayState && (millis() - pumpStartTime < MIN_RUNTIME)) {
-    shouldBeOn = true;
-  }
-
-  // Oververhitting: forceert AAN + PWM direct naar max (bewust geen ramp, veiligheid > geleidelijkheid)
+  // Oververhitting: forceert AAN + PWM direct naar max (bewust geen PID, veiligheid > geleidelijkheid)
   bool overheat = (Tsun >= 90.0);
   if (overheat) {
     shouldBeOn = true;
     sprintf(str, "Pump MAX - Collector >= 90C");
   }
 
-  float pwmDoel = 0;
-
-  if (shouldBeOn) {
-    if (!relayState) {
-      sprintf(str, "Pump STARTED - dT=%.1fC", dT);
-      consecutiveReductions = 0;
-      pumpStartTime = millis();
-    }
-    digitalWrite(relayPin, LOW);
-    relayState = true; relay = 1;
-
-    if (overheat) {
-      pwmDoel = 255;
-    } else if (Tsun > 75.0) {
-      pwmDoel = 180;
-    } else {
-      float delta = constrain(dT - 3.0, 0.0, 17.0);
-      pwmDoel = PWM_MIN_RUN + (delta * (200.0 - PWM_MIN_RUN) / 17.0);
-    }
-  } else {
-    if (relayState) sprintf(str, "Pump OFF - geen zon of verlies-streak");
+  if (!shouldBeOn) {
+    if (relayState) sprintf(str, "Pump OFF - dT te laag of verlies-streak");
     digitalWrite(relayPin, HIGH);
     relayState = false; relay = 0;
-    pwmDoel = 0;
+    pwmValue = 0;
+    pidIntegral = 0;      // reset zodat er geen windup optreedt terwijl de pomp stilstaat
+    pidPrevError = 0;
+    analogWrite(pwmPin, 0);
+    return;
   }
 
-  // PWM geleidelijk naar het doel laten bewegen, behalve bij oververhitting
+  // --- Pomp is/wordt AAN: PID regelt de snelheid rond DT_TARGET ---
+  unsigned long nowMs = millis();
+  double dtMin = 1.0;  // tijd sinds vorige PID-stap, in minuten
+
+  if (!relayState) {
+    sprintf(str, "Pump STARTED - dT=%.1fC", dT);
+    pumpStartTime = nowMs;
+    pidIntegral = 0;
+    pidPrevError = dT - DT_TARGET;   // voorkomt een D-piek bij de allereerste stap
+  } else if (lastPidTime > 0) {
+    dtMin = (double)(nowMs - lastPidTime) / 60000.0;
+    if (dtMin <= 0) dtMin = 1.0;
+  }
+  lastPidTime = nowMs;
+
+  digitalWrite(relayPin, LOW);
+  relayState = true; relay = 1;
+
+  double pwmDoel;
+
+  if (overheat) {
+    pwmDoel = 255;
+  } else if (Tsun > 75.0) {
+    pwmDoel = 180;
+  } else {
+    double error = dT - DT_TARGET;
+    pidIntegral = constrain(pidIntegral + error * dtMin, -PID_I_MAX, PID_I_MAX);
+    double derivative = (error - pidPrevError) / dtMin;
+    pidPrevError = error;
+
+    double pidOutput = (Kp * error) + (Ki * pidIntegral) + (Kd * derivative);
+    pwmDoel = constrain(PWM_MIN_RUN + pidOutput, PWM_MIN_RUN, 255);
+  }
+
+  // Extra veiligheidslimiet bovenop de PID: max verandering per minuut
   if (overheat) {
     pwmValue = pwmDoel;
   } else if (pwmValue < pwmDoel) {
-    pwmValue = min(pwmValue + PWM_RAMP_STEP, pwmDoel);
+    pwmValue = min(pwmValue + PWM_RAMP_STEP * dtMin, pwmDoel);
   } else if (pwmValue > pwmDoel) {
-    pwmValue = max(pwmValue - PWM_RAMP_STEP, pwmDoel);
+    pwmValue = max(pwmValue - PWM_RAMP_STEP * dtMin, pwmDoel);
   }
 
-  if (relayState) {
-    sprintf(str, "Pump ON - dT=%.1f Tsun=%.1f PWM=%d", dT, Tsun, (int)pwmValue);
-  }
-
+  sprintf(str, "Pump ON - dT=%.1f Tsun=%.1f PWM=%d (err=%.1f)", dT, Tsun, (int)pwmValue, dT - DT_TARGET);
   analogWrite(pwmPin, (int)pwmValue);
 }
 
