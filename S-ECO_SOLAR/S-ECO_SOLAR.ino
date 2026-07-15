@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 15jul26: dT-filter (EMA) toegevoegd tegen de "hete-plug"-piek bij pompstart (dT schoot 18-40°C op en stortte dan in) — hysterese én PID gebruiken nu dTFiltered i.p.v. de ruwe waarde. PWM_RAMP_STEP verhoogd van 25 naar 60/min: die was de facto de enige actieve regelaar geworden (elke cyclus identieke trap 25-50-75-100-125 ongeacht dT-piek, PID werd altijd tegen 255 geklemd) (Claude)
 - 14jul26b: solarPump() omgebouwd naar PID-regeling (DT_TARGET=2.5°C) i.p.v. drempel+ramp; lost de blijvende 9-minuten aan/uit-cyclus op door de PWM continu naar een evenwicht te laten zoeken i.p.v. te forceren met een minimale looptijd (Claude)
 - 14jul26: Hysterese (aan bij dT>3.0, uit pas bij dT<1.0) + minimale looptijd (4') + PWM-ramp (max 40/min) toegevoegd in solarPump() om abrupt aan/uit schakelen en PWM-sprongen te voorkomen (Claude)
 - 26dec25: Correctie in de logica (Grok) + 2e correctie! (pump function)
@@ -139,9 +140,14 @@ double pidIntegral = 0;
 double pidPrevError = 0;
 const double PID_I_MAX = 50.0;   // anti-windup clamp op de integraalterm
 double PWM_MIN_RUN = 60;         // ondergrens PWM zolang de pomp draait
-double PWM_RAMP_STEP = 25;       // extra veiligheidslimiet: max PWM-verandering per minuut, bovenop de PID
+double PWM_RAMP_STEP = 60;       // extra veiligheidslimiet: max PWM-verandering per minuut, bovenop de PID
 unsigned long pumpStartTime = 0;
 unsigned long lastPidTime = 0;
+
+// dT-filter (EMA) tegen de "hete-plug"-piek bij pompstart, 15jul26
+double dTFiltered = 0;
+bool dTFilterInit = false;
+const double DT_FILTER_ALPHA = 0.3;  // per minuut; lager = trager/gladder, hoger = reageert sneller
 
 // Define timer to call solarPump function
 const unsigned long pumpInterval = 1 * 60 * 1000;
@@ -343,11 +349,22 @@ void solarPump() {
     return;
   }
 
+  // dT-filter (EMA): dempt de korte, hevige piek van de "hete plug" bij pompstart
+  // (dT schoot voorheen naar 18-40°C op en stortte een minuut later in - een
+  // meetartefact, geen echt duurzaam warmteoverschot). Hysterese én PID werken
+  // hierna met dTFiltered i.p.v. de ruwe dT.
+  if (!dTFilterInit) {
+    dTFiltered = dT;
+    dTFilterInit = true;
+  } else {
+    dTFiltered += DT_FILTER_ALPHA * (dT - dTFiltered);
+  }
+
   // Hysterese voor de relay zelf: start bij DT_START, stop pas bij DT_STOP (PID regelt de snelheid ertussenin)
-  bool shouldBeOn = relayState ? (dT > DT_STOP) : (dT > DT_START);
+  bool shouldBeOn = relayState ? (dTFiltered > DT_STOP) : (dTFiltered > DT_START);
 
   // Thermosifon blokkeren
-  if (dT > DT_START && Tsun < 22.0) {
+  if (dTFiltered > DT_START && Tsun < 22.0) {
     shouldBeOn = false;
     sprintf(str, "Pump OFF - Thermosifon (Tsun=%.1fC)", Tsun);
   }
@@ -387,10 +404,10 @@ void solarPump() {
   double dtMin = 1.0;  // tijd sinds vorige PID-stap, in minuten
 
   if (!relayState) {
-    sprintf(str, "Pump STARTED - dT=%.1fC", dT);
+    sprintf(str, "Pump STARTED - dT=%.1fC (gefilterd %.1fC)", dT, dTFiltered);
     pumpStartTime = nowMs;
     pidIntegral = 0;
-    pidPrevError = dT - DT_TARGET;   // voorkomt een D-piek bij de allereerste stap
+    pidPrevError = dTFiltered - DT_TARGET;   // voorkomt een D-piek bij de allereerste stap
   } else if (lastPidTime > 0) {
     dtMin = (double)(nowMs - lastPidTime) / 60000.0;
     if (dtMin <= 0) dtMin = 1.0;
@@ -407,7 +424,7 @@ void solarPump() {
   } else if (Tsun > 75.0) {
     pwmDoel = 180;
   } else {
-    double error = dT - DT_TARGET;
+    double error = dTFiltered - DT_TARGET;
     pidIntegral = constrain(pidIntegral + error * dtMin, -PID_I_MAX, PID_I_MAX);
     double derivative = (error - pidPrevError) / dtMin;
     pidPrevError = error;
@@ -425,7 +442,7 @@ void solarPump() {
     pwmValue = max(pwmValue - PWM_RAMP_STEP * dtMin, pwmDoel);
   }
 
-  sprintf(str, "Pump ON - dT=%.1f Tsun=%.1f PWM=%d (err=%.1f)", dT, Tsun, (int)pwmValue, dT - DT_TARGET);
+  sprintf(str, "Pump ON - dT=%.1f (gefilterd %.1f) Tsun=%.1f PWM=%d (err=%.1f)", dT, dTFiltered, Tsun, (int)pwmValue, dTFiltered - DT_TARGET);
   analogWrite(pwmPin, (int)pwmValue);
 }
 
