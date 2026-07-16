@@ -1,28 +1,10 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 16jul26: KRITIEKE BUGFIX - consecutiveReductions (verlies-streak-teller) werd sinds de PID-ombouw (14jul26b) nooit meer gereset bij een echte herstart van de pomp. Gevolg: eens de teller op 3 stond, bleef de pomp permanent OFF (deadlock), zelfs bij dT tot 38,9°C en Tsol tot bijna 90°C - enkel een reboot herstelde het. Reset toegevoegd in de start-branch van solarPump() (Claude)
 - 15jul26: dT-filter (EMA) toegevoegd tegen de "hete-plug"-piek bij pompstart (dT schoot 18-40°C op en stortte dan in) — hysterese én PID gebruiken nu dTFiltered i.p.v. de ruwe waarde. PWM_RAMP_STEP verhoogd van 25 naar 60/min: die was de facto de enige actieve regelaar geworden (elke cyclus identieke trap 25-50-75-100-125 ongeacht dT-piek, PID werd altijd tegen 255 geklemd) (Claude)
 - 14jul26b: solarPump() omgebouwd naar PID-regeling (DT_TARGET=2.5°C) i.p.v. drempel+ramp; lost de blijvende 9-minuten aan/uit-cyclus op door de PWM continu naar een evenwicht te laten zoeken i.p.v. te forceren met een minimale looptijd (Claude)
 - 14jul26: Hysterese (aan bij dT>3.0, uit pas bij dT<1.0) + minimale looptijd (4') + PWM-ramp (max 40/min) toegevoegd in solarPump() om abrupt aan/uit schakelen en PWM-sprongen te voorkomen (Claude)
-- 26dec25: Correctie in de logica (Grok) + 2e correctie! (pump function)
-- 3dec25: Correctie in de logica (Grok)
-- 26nov25: Correctie in de initialisatie van enkele variabelen (Grok)
-- 25nov25: Correctie in de solarPump() functie!
-- 24nov25: Corrigeerde met Grok: 1) Fout voor PT1000 temperature MAX31865 printje (in geval het vriest). 2) Nieuwe logica in solarPump() functie
-- 18nov25: Pomp kan 's nachts NIET draaien (Startte als het vriest 's nachts (door fout in PT1000 temperature MAX31865 printje).
-- 5nov25: Alles ivm Sunlevel verwijderd. Nieuwe berekening van dEQ over 10 min.
-- 4nov25: Wifi% naar RSSI (dB) gewijzigd. sunlevel niet meer gebruikt (EventDecoder voor "SUN" weggelaten)
-- 3nov25: Analysis by Grok: Photon valt regelmatig uit! => 1) Memory leak in EventDecoder()! 2) New functie getTemperatures() zonder delay(1000). Verfijning van de pomplogica. 2 extra diagnose velden voor google sheet.
-- 21oct23: Reduce unnecessary particle.publish commands
-- 4mei23: Added a message (ex: ECO: 9.63 kWh) published for the HVAC system to activate the ECOtransfer() pumps to store excess energy in the cellar boilers (SCH+WON)
-- 25apr23: Installed & tested to replace OEG controller: Made adjustments in the pwm calculation logic...
-- 21apr23: Modified pump ON/OFF logic to more complex logic: 4 consecutive red. then <2000 lux
-- 15apr23: Added the new pump control logic (assisted by ChatGPT3.5) Made also a "simulator" sketch to test this logic.
--  4apr23: Added Sunlight data (like in roomsketches) to find an alternative SOLAR ON/OFF method.
-- 27mar23: Integrated SOLAR pump controller with PT1000 sensor in collector (on the roof)
-- 24dec22: Added Homebridge reporting => Sending the total boiler energy (EQTOT) as a temperature to Homebridge (visualize it on iPhone)
-- 25sep21: Reduced messaging intervals
-- 14oct19: Created JSON publish string with all temperatures.
 
 Features:
 - Reads the six "hardcoded" DS18x20 sensors of the ECO boiler by their HEX sensor code and use them in the loop() by their own names.
@@ -371,6 +353,14 @@ void solarPump() {
 
   // Verlies-streak alleen als niet geblokkeerd door thermosifon
   if (shouldBeOn) {
+    // KRITIEK: als de pomp vorige cyclus nog stillag, is dit een verse startpoging -
+    // geef de teller een schone lei. Zonder dit bleef een eerder vastgelopen teller
+    // (>=3) voor altijd staan, want zolang de pomp niet draait komt er ook nooit een
+    // positieve dEQ om hem te resetten: een permanente deadlock, ongeacht hoe hoog
+    // dT opliep (op 16jul26 gezien: dT tot 38,9°C, Tsol tot bijna 90°C, pomp bleef OFF)
+    if (!relayState) {
+      consecutiveReductions = 0;
+    }
     if (dEQ > 0.0) {
       consecutiveReductions = 0;
     } else if (dEQ <= 0.0) {
