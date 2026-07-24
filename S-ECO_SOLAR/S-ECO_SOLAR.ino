@@ -1,6 +1,9 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 24jul26: dEQ herbouwd als glijdend venster van 10 minuten historiek (i.p.v. een 1x/10' snapshot). Elke minuut een verse waarde, mét de resolutie van een volledig 10-minutenvenster (vermijdt afrondingsruis van EQtot's 2 decimalen bij een korter venster). Volledig zelfstandig aan de Photon - geen enkele koppeling meer met hoe vaak Google Sheets logt, en geen "dEQFresh"-vlag meer nodig (Claude)
+- 17jul26b: KRITIEKE BUGFIX - dEQ werd maar 1x per 10' herberekend, maar de verlies-streak-check in solarPump() las die waarde elke minuut opnieuw. Bij een toevallig stale dEQ=0,000 (bv. net na een reflash) liep de streak-teller 8-10x op in evenveel minuten, terwijl EQtot intussen gewoon steeg - de BEPERKT-fase greep dus onterecht in. (Inmiddels vervangen door het glijdend venster hierboven, dat dit probleem structureel oplost i.p.v. te symptoombestrijden) (Claude)
+- 17jul26: Fase-gebaseerde overgangsdemping tegen de zware overshoots bij dagbegin/-einde: (1) opstartfase van 4' na elke pompstart met PWM begrensd op 90, dempt de "hete-plug"-piek vóór de PID overneemt; (2) verlies-streak stopt de pomp niet meer hard, maar begrenst enkel PWM naar het minimum (pomp blijft draaien i.p.v. herhaaldelijk te herstarten); (3) stop-hysterese met debounce (2 opeenvolgende cycli onder DT_STOP) tegen het avond-geflipper rond de drempel (Claude)
 - 16jul26: KRITIEKE BUGFIX - consecutiveReductions (verlies-streak-teller) werd sinds de PID-ombouw (14jul26b) nooit meer gereset bij een echte herstart van de pomp. Gevolg: eens de teller op 3 stond, bleef de pomp permanent OFF (deadlock), zelfs bij dT tot 38,9°C en Tsol tot bijna 90°C - enkel een reboot herstelde het. Reset toegevoegd in de start-branch van solarPump() (Claude)
 - 15jul26: dT-filter (EMA) toegevoegd tegen de "hete-plug"-piek bij pompstart (dT schoot 18-40°C op en stortte dan in) — hysterese én PID gebruiken nu dTFiltered i.p.v. de ruwe waarde. PWM_RAMP_STEP verhoogd van 25 naar 60/min: die was de facto de enige actieve regelaar geworden (elke cyclus identieke trap 25-50-75-100-125 ongeacht dT-piek, PID werd altijd tegen 255 geklemd) (Claude)
 - 14jul26b: solarPump() omgebouwd naar PID-regeling (DT_TARGET=2.5°C) i.p.v. drempel+ramp; lost de blijvende 9-minuten aan/uit-cyclus op door de PWM continu naar een evenwicht te laten zoeken i.p.v. te forceren met een minimale looptijd (Claude)
@@ -94,9 +97,16 @@ int getTemperaturesLastTime = millis() - getTemperaturesInterval;  // Reset so t
 double celsius;
 double ETmin = 35; // Minimum ECO boiler temperature to calculate "spare" energy (Securing Hot water supply)
 double EAv1, EAv2, EAv3, EAv4, EAv5, EAv; // Average temperatures
-double EQ1, EQ2, EQ3, EQ4, EQ5, EQtot, prev_EQtot, dEQ; // Boiler energy
-const unsigned long DEQ_INTERVAL = 10 * 60 * 1000; // Elke 10' een dEQ voor JSON STRING
-static unsigned long lastDEQcalc = 0;
+double EQ1, EQ2, EQ3, EQ4, EQ5, EQtot, dEQ; // Boiler energy
+// dEQ als glijdend venster van 10 minuten historiek, elke minuut vers berekend
+// (24jul26) - vermijdt zowel het "stale waarde herhaaldelijk aflezen"-probleem
+// als afrondingsruis, en is volledig onafhankelijk van de logging-frequentie
+// naar Google Sheets (die twee hebben nooit iets met elkaar te maken gehad).
+const int DEQ_WINDOW_SIZE = 10;       // minuten historiek
+double eqHistory[DEQ_WINDOW_SIZE];
+int eqHistoryCount = 0;               // hoeveel geldige samples we al hebben (max DEQ_WINDOW_SIZE)
+int eqHistoryIndex = 0;               // volgende schrijfpositie (circulair)
+bool dEQWindowReady = false;          // pas true zodra een volledig venster beschikbaar is
 
 // Define variables for SOLAR controller: *A7: PWM, *D2: relay
 int relayPin = D2;
@@ -130,6 +140,12 @@ unsigned long lastPidTime = 0;
 double dTFiltered = 0;
 bool dTFilterInit = false;
 const double DT_FILTER_ALPHA = 0.3;  // per minuut; lager = trager/gladder, hoger = reageert sneller
+
+// Fase-gebaseerde overgangsdemping tegen zware overshoots bij dagbegin/-einde, 17jul26
+const unsigned long SOFT_START_MIN = 4;   // minuten na pompstart dat PWM begrensd blijft
+double SOFT_START_PWM_CAP = 90;           // PWM-grens tijdens opstartfase
+int belowStopCount = 0;
+const int STOP_DEBOUNCE_CYCLES = 2;       // aantal opeenvolgende cycli onder DT_STOP vooraleer echt te stoppen
 
 // Define timer to call solarPump function
 const unsigned long pumpInterval = 1 * 60 * 1000;
@@ -242,11 +258,20 @@ void loop()
     EQ5 = (EAv5-ETmin)*110*1.163/1000;
     EQtot = EQ1+EQ2+EQ3+EQ4+EQ5;
 
-    if (millis() - lastDEQcalc >= DEQ_INTERVAL)
-    {
-      dEQ = (EQtot - prev_EQtot);
-      prev_EQtot = EQtot;
-      lastDEQcalc = millis();
+    // Glijdend venster van 10 minuten: elke minuut vers, met de resolutie van
+    // een vol 10-minutenvenster (vermijdt afrondingsruis op EQtot's 2 decimalen)
+    if (eqHistoryCount < DEQ_WINDOW_SIZE) {
+      eqHistory[eqHistoryIndex] = EQtot;
+      eqHistoryIndex = (eqHistoryIndex + 1) % DEQ_WINDOW_SIZE;
+      eqHistoryCount++;
+      dEQ = 0;
+      dEQWindowReady = false;   // nog geen vol venster (bv. net opgestart) - neutraal, telt niet mee
+    } else {
+      double oldest = eqHistory[eqHistoryIndex];
+      dEQ = EQtot - oldest;
+      eqHistory[eqHistoryIndex] = EQtot;
+      eqHistoryIndex = (eqHistoryIndex + 1) % DEQ_WINDOW_SIZE;
+      dEQWindowReady = true;
     }
 
 
@@ -327,6 +352,7 @@ void solarPump() {
     sprintf(str, "Pump OFF - Nachtblokkering");
     analogWrite(pwmPin, 0);
     consecutiveReductions = 0;
+    belowStopCount = 0;
     pidIntegral = 0; pidPrevError = 0;
     return;
   }
@@ -342,8 +368,22 @@ void solarPump() {
     dTFiltered += DT_FILTER_ALPHA * (dT - dTFiltered);
   }
 
-  // Hysterese voor de relay zelf: start bij DT_START, stop pas bij DT_STOP (PID regelt de snelheid ertussenin)
-  bool shouldBeOn = relayState ? (dTFiltered > DT_STOP) : (dTFiltered > DT_START);
+  // Hysterese voor de relay zelf, met debounce op de stop-kant: pas echt stoppen
+  // na STOP_DEBOUNCE_CYCLES opeenvolgende metingen onder DT_STOP. Dempt het
+  // geflipper 's avonds wanneer dT lang rond de drempel blijft hangen.
+  bool shouldBeOn;
+  if (relayState) {
+    if (dTFiltered > DT_STOP) {
+      shouldBeOn = true;
+      belowStopCount = 0;
+    } else {
+      belowStopCount++;
+      shouldBeOn = (belowStopCount < STOP_DEBOUNCE_CYCLES);
+    }
+  } else {
+    shouldBeOn = (dTFiltered > DT_START);
+    belowStopCount = 0;
+  }
 
   // Thermosifon blokkeren
   if (dTFiltered > DT_START && Tsun < 22.0) {
@@ -351,40 +391,46 @@ void solarPump() {
     sprintf(str, "Pump OFF - Thermosifon (Tsun=%.1fC)", Tsun);
   }
 
-  // Verlies-streak alleen als niet geblokkeerd door thermosifon
+  // Verlies-streak: stopt de pomp niet langer hard, maar begrenst enkel de PWM
+  // naar het minimum zolang er geen energiewinst is. De pomp blijft draaien
+  // i.p.v. herhaaldelijk te herstarten (elke herstart geeft immers een nieuwe
+  // "hete-plug"-piek, wat net de bron van de overshoots was).
+  // dEQ is sinds 24jul26 een glijdend 10-minutenvenster dat élke minuut vers
+  // berekend wordt, dus deze check mag gewoon elke cyclus meetellen - geen
+  // aparte "fresh"-vlag meer nodig. Zolang er nog geen vol venster is
+  // (dEQWindowReady=false, bv. net opgestart) telt de check gewoon niet mee.
+  bool lossCapped = false;
   if (shouldBeOn) {
-    // KRITIEK: als de pomp vorige cyclus nog stillag, is dit een verse startpoging -
-    // geef de teller een schone lei. Zonder dit bleef een eerder vastgelopen teller
-    // (>=3) voor altijd staan, want zolang de pomp niet draait komt er ook nooit een
-    // positieve dEQ om hem te resetten: een permanente deadlock, ongeacht hoe hoog
-    // dT opliep (op 16jul26 gezien: dT tot 38,9°C, Tsol tot bijna 90°C, pomp bleef OFF)
     if (!relayState) {
-      consecutiveReductions = 0;
+      consecutiveReductions = 0;   // verse startpoging: schone lei (zie 16jul26 bugfix)
     }
-    if (dEQ > 0.0) {
-      consecutiveReductions = 0;
-    } else if (dEQ <= 0.0) {
-      consecutiveReductions++;
-      if (consecutiveReductions >= 3) {
-        shouldBeOn = false;
+    if (dEQWindowReady) {
+      if (dEQ > 0.0) {
+        consecutiveReductions = 0;
+      } else {
+        consecutiveReductions++;
       }
+    }
+    if (consecutiveReductions >= 3) {
+      lossCapped = true;
     }
   }
 
-  // Oververhitting: forceert AAN + PWM direct naar max (bewust geen PID, veiligheid > geleidelijkheid)
+  // Oververhitting: forceert AAN + PWM direct naar max, overschrijft alle andere logica
   bool overheat = (Tsun >= 90.0);
   if (overheat) {
     shouldBeOn = true;
-    sprintf(str, "Pump MAX - Collector >= 90C");
+    lossCapped = false;
   }
 
   if (!shouldBeOn) {
-    if (relayState) sprintf(str, "Pump OFF - dT te laag of verlies-streak");
+    if (relayState) sprintf(str, "Pump OFF - dT gefilterd=%.1fC <= stopdrempel", dTFiltered);
     digitalWrite(relayPin, HIGH);
     relayState = false; relay = 0;
     pwmValue = 0;
     pidIntegral = 0;      // reset zodat er geen windup optreedt terwijl de pomp stilstaat
     pidPrevError = 0;
+    belowStopCount = 0;
     analogWrite(pwmPin, 0);
     return;
   }
@@ -392,9 +438,9 @@ void solarPump() {
   // --- Pomp is/wordt AAN: PID regelt de snelheid rond DT_TARGET ---
   unsigned long nowMs = millis();
   double dtMin = 1.0;  // tijd sinds vorige PID-stap, in minuten
+  bool justStarted = !relayState;
 
-  if (!relayState) {
-    sprintf(str, "Pump STARTED - dT=%.1fC (gefilterd %.1fC)", dT, dTFiltered);
+  if (justStarted) {
     pumpStartTime = nowMs;
     pidIntegral = 0;
     pidPrevError = dTFiltered - DT_TARGET;   // voorkomt een D-piek bij de allereerste stap
@@ -406,6 +452,8 @@ void solarPump() {
 
   digitalWrite(relayPin, LOW);
   relayState = true; relay = 1;
+
+  bool inSoftStart = (nowMs - pumpStartTime) < (SOFT_START_MIN * 60000UL);
 
   double pwmDoel;
 
@@ -421,6 +469,16 @@ void solarPump() {
 
     double pidOutput = (Kp * error) + (Ki * pidIntegral) + (Kd * derivative);
     pwmDoel = constrain(PWM_MIN_RUN + pidOutput, PWM_MIN_RUN, 255);
+
+    // Opstartfase: PWM hard begrensd, ongeacht wat de PID wil - geeft de
+    // "hete plug" tijd om weg te stromen vóór de PID volledig overneemt.
+    if (inSoftStart) {
+      pwmDoel = min(pwmDoel, SOFT_START_PWM_CAP);
+    }
+    // Verlies-streak: PWM begrensd op het minimum zolang er geen energiewinst is.
+    if (lossCapped) {
+      pwmDoel = min(pwmDoel, PWM_MIN_RUN);
+    }
   }
 
   // Extra veiligheidslimiet bovenop de PID: max verandering per minuut
@@ -432,7 +490,16 @@ void solarPump() {
     pwmValue = max(pwmValue - PWM_RAMP_STEP * dtMin, pwmDoel);
   }
 
-  sprintf(str, "Pump ON - dT=%.1f (gefilterd %.1f) Tsun=%.1f PWM=%d (err=%.1f)", dT, dTFiltered, Tsun, (int)pwmValue, dTFiltered - DT_TARGET);
+  // Status: geeft altijd exact de actieve fase weer
+  if (overheat) {
+    sprintf(str, "Pump ON (OVERVERHIT) - Tsun=%.1fC >= 90C, PWM=255", Tsun);
+  } else if (inSoftStart) {
+    sprintf(str, "Pump ON (OPSTART) - dT gefilterd=%.1fC, PWM begrensd op %d", dTFiltered, (int)SOFT_START_PWM_CAP);
+  } else if (lossCapped) {
+    sprintf(str, "Pump ON (BEPERKT) - geen energiewinst (dEQ<=0, %dx), PWM begrensd op minimum", consecutiveReductions);
+  } else {
+    sprintf(str, "Pump ON (REGIME) - dT gefilterd=%.1fC PWM=%d (fout=%.1f)", dTFiltered, (int)pwmValue, dTFiltered - DT_TARGET);
+  }
   analogWrite(pwmPin, (int)pwmValue);
 }
 
