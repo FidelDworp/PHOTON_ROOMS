@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 25jul26: (1) Verlies-streak vervangen door een gegradueerde reactie: een opgebouwde "verliesminuten"-teller die sneller oploopt bij een groter verlies (0,5x-3x tempo t.o.v. een typisch verlies) en het PWM-plafond geleidelijk laat zakken over ~15 minuten i.p.v. een harde knip na een vast aantal cycli - herstelt ook sneller (-3/min) zodra dEQ weer positief is. (2) Anti-windup: de PID-integraalterm wordt bevroren zolang de PWM toch al door de opstart- of verliesbegrenzing tegengehouden wordt, tegen de PWM-piek die ontstond zodra zo'n plafond wegviel. (3) Opstartfase verlengd van 4 naar 6 minuten (Claude)
 - 24jul26: dEQ herbouwd als glijdend venster van 10 minuten historiek (i.p.v. een 1x/10' snapshot). Elke minuut een verse waarde, mét de resolutie van een volledig 10-minutenvenster (vermijdt afrondingsruis van EQtot's 2 decimalen bij een korter venster). Volledig zelfstandig aan de Photon - geen enkele koppeling meer met hoe vaak Google Sheets logt, en geen "dEQFresh"-vlag meer nodig (Claude)
 - 17jul26b: KRITIEKE BUGFIX - dEQ werd maar 1x per 10' herberekend, maar de verlies-streak-check in solarPump() las die waarde elke minuut opnieuw. Bij een toevallig stale dEQ=0,000 (bv. net na een reflash) liep de streak-teller 8-10x op in evenveel minuten, terwijl EQtot intussen gewoon steeg - de BEPERKT-fase greep dus onterecht in. (Inmiddels vervangen door het glijdend venster hierboven, dat dit probleem structureel oplost i.p.v. te symptoombestrijden) (Claude)
 - 17jul26: Fase-gebaseerde overgangsdemping tegen de zware overshoots bij dagbegin/-einde: (1) opstartfase van 4' na elke pompstart met PWM begrensd op 90, dempt de "hete-plug"-piek vóór de PID overneemt; (2) verlies-streak stopt de pomp niet meer hard, maar begrenst enkel PWM naar het minimum (pomp blijft draaien i.p.v. herhaaldelijk te herstarten); (3) stop-hysterese met debounce (2 opeenvolgende cycli onder DT_STOP) tegen het avond-geflipper rond de drempel (Claude)
@@ -119,7 +120,6 @@ double Tsun = 0;
 double dT = Tsun - Tboil;
 double Hysteresis = 1;
 double pwmValue = 0; // 0-255 (Use double to calculate)
-int consecutiveReductions = 0;  // Initialize counter for consecutive energy reductions (dEQ<=0)
 
 // PID-regelaar voor pompsnelheid (vervangt drempel+ramp), 14jul26b
 double DT_TARGET = 2.5;          // gewenste dT-evenwicht i.p.v. aan/uit-cyclus
@@ -141,11 +141,20 @@ double dTFiltered = 0;
 bool dTFilterInit = false;
 const double DT_FILTER_ALPHA = 0.3;  // per minuut; lager = trager/gladder, hoger = reageert sneller
 
-// Fase-gebaseerde overgangsdemping tegen zware overshoots bij dagbegin/-einde, 17jul26
-const unsigned long SOFT_START_MIN = 4;   // minuten na pompstart dat PWM begrensd blijft
+// Fase-gebaseerde overgangsdemping tegen zware overshoots bij dagbegin/-einde, 17jul26/25jul26
+const unsigned long SOFT_START_MIN = 6;   // minuten na pompstart dat PWM begrensd blijft
 double SOFT_START_PWM_CAP = 90;           // PWM-grens tijdens opstartfase
 int belowStopCount = 0;
 const int STOP_DEBOUNCE_CYCLES = 2;       // aantal opeenvolgende cycli onder DT_STOP vooraleer echt te stoppen
+
+// Gegradueerde verlies-reactie (vervangt de harde "3x streak"-knip), 25jul26:
+// het PWM-plafond zakt geleidelijk naarmate dEQ langer/sterker negatief blijft,
+// i.p.v. in één klap naar het minimum te springen. Groter verlies -> sneller
+// strenger; herstel bij winst gaat sneller dan de opbouw bij verlies.
+double lossMinutes = 0;                  // opgebouwde "verliesminuten", 0 = geen beperking
+const double LOSS_MINUTES_FULL = 15.0;   // bij dit aantal is het plafond volledig naar het minimum gezakt
+const double LOSS_REF = 0.05;            // kWh/venster - typische verliesgrootte als ijkpunt
+const double LOSS_RECOVERY = 3.0;        // afname per minuut zodra dEQ weer positief is (sneller dan opbouw)
 
 // Define timer to call solarPump function
 const unsigned long pumpInterval = 1 * 60 * 1000;
@@ -200,7 +209,7 @@ void setup()
   SPI.begin();
   sensor.begin(MAX31865_2WIRE); // set to 2WIRE connection
 
-  consecutiveReductions = 0;
+  lossMinutes = 0;
 
   // GENERAL Particle functions:
   Particle.function("Manual", manual);
@@ -351,7 +360,7 @@ void solarPump() {
     relayState = false; relay = 0; pwmValue = 0;
     sprintf(str, "Pump OFF - Nachtblokkering");
     analogWrite(pwmPin, 0);
-    consecutiveReductions = 0;
+    lossMinutes = 0;
     belowStopCount = 0;
     pidIntegral = 0; pidPrevError = 0;
     return;
@@ -391,36 +400,33 @@ void solarPump() {
     sprintf(str, "Pump OFF - Thermosifon (Tsun=%.1fC)", Tsun);
   }
 
-  // Verlies-streak: stopt de pomp niet langer hard, maar begrenst enkel de PWM
-  // naar het minimum zolang er geen energiewinst is. De pomp blijft draaien
-  // i.p.v. herhaaldelijk te herstarten (elke herstart geeft immers een nieuwe
-  // "hete-plug"-piek, wat net de bron van de overshoots was).
-  // dEQ is sinds 24jul26 een glijdend 10-minutenvenster dat élke minuut vers
-  // berekend wordt, dus deze check mag gewoon elke cyclus meetellen - geen
-  // aparte "fresh"-vlag meer nodig. Zolang er nog geen vol venster is
-  // (dEQWindowReady=false, bv. net opgestart) telt de check gewoon niet mee.
-  bool lossCapped = false;
+  // Gegradueerde verlies-reactie (25jul26): het PWM-plafond zakt geleidelijk
+  // naarmate dEQ langer/sterker negatief blijft, i.p.v. in één klap naar het
+  // minimum te springen bij een vaste teller. dEQ is een glijdend 10-minuten-
+  // venster dat elke minuut vers berekend wordt (24jul26), dus deze update mag
+  // gewoon elke cyclus gebeuren. Zolang er nog geen vol venster is
+  // (dEQWindowReady=false, bv. net opgestart) blijft lossMinutes ongewijzigd.
+  double lossCapFraction = 0;
   if (shouldBeOn) {
     if (!relayState) {
-      consecutiveReductions = 0;   // verse startpoging: schone lei (zie 16jul26 bugfix)
+      lossMinutes = 0;   // verse startpoging: schone lei (zie 16jul26 bugfix)
     }
     if (dEQWindowReady) {
       if (dEQ > 0.0) {
-        consecutiveReductions = 0;
+        lossMinutes = max(0.0, lossMinutes - LOSS_RECOVERY);
       } else {
-        consecutiveReductions++;
+        double weight = constrain((-dEQ) / LOSS_REF, 0.5, 3.0);
+        lossMinutes = min(lossMinutes + weight, LOSS_MINUTES_FULL * 1.5);
       }
     }
-    if (consecutiveReductions >= 3) {
-      lossCapped = true;
-    }
+    lossCapFraction = constrain(lossMinutes / LOSS_MINUTES_FULL, 0.0, 1.0);
   }
 
   // Oververhitting: forceert AAN + PWM direct naar max, overschrijft alle andere logica
   bool overheat = (Tsun >= 90.0);
   if (overheat) {
     shouldBeOn = true;
-    lossCapped = false;
+    lossCapFraction = 0;
   }
 
   if (!shouldBeOn) {
@@ -454,6 +460,7 @@ void solarPump() {
   relayState = true; relay = 1;
 
   bool inSoftStart = (nowMs - pumpStartTime) < (SOFT_START_MIN * 60000UL);
+  bool restricted = inSoftStart || (lossCapFraction > 0.0);
 
   double pwmDoel;
 
@@ -463,7 +470,14 @@ void solarPump() {
     pwmDoel = 180;
   } else {
     double error = dTFiltered - DT_TARGET;
-    pidIntegral = constrain(pidIntegral + error * dtMin, -PID_I_MAX, PID_I_MAX);
+
+    // Anti-windup (25jul26): de integraalterm bevriezen zolang de PWM toch al
+    // door de opstart- of verliesbegrenzing tegengehouden wordt. Zonder dit
+    // stapelt de integraal zich op tijdens zo'n plafond en "ontlaadt" ze zich
+    // in een PWM-piek zodra het plafond wegvalt.
+    if (!restricted) {
+      pidIntegral = constrain(pidIntegral + error * dtMin, -PID_I_MAX, PID_I_MAX);
+    }
     double derivative = (error - pidPrevError) / dtMin;
     pidPrevError = error;
 
@@ -475,9 +489,10 @@ void solarPump() {
     if (inSoftStart) {
       pwmDoel = min(pwmDoel, SOFT_START_PWM_CAP);
     }
-    // Verlies-streak: PWM begrensd op het minimum zolang er geen energiewinst is.
-    if (lossCapped) {
-      pwmDoel = min(pwmDoel, PWM_MIN_RUN);
+    // Gegradueerde verlies-begrenzing: plafond zakt geleidelijk mee met lossCapFraction.
+    if (lossCapFraction > 0.0) {
+      double pwmCeiling = 255.0 - lossCapFraction * (255.0 - PWM_MIN_RUN);
+      pwmDoel = min(pwmDoel, pwmCeiling);
     }
   }
 
@@ -495,8 +510,8 @@ void solarPump() {
     sprintf(str, "Pump ON (OVERVERHIT) - Tsun=%.1fC >= 90C, PWM=255", Tsun);
   } else if (inSoftStart) {
     sprintf(str, "Pump ON (OPSTART) - dT gefilterd=%.1fC, PWM begrensd op %d", dTFiltered, (int)SOFT_START_PWM_CAP);
-  } else if (lossCapped) {
-    sprintf(str, "Pump ON (BEPERKT) - geen energiewinst (dEQ<=0, %dx), PWM begrensd op minimum", consecutiveReductions);
+  } else if (lossCapFraction > 0.0) {
+    sprintf(str, "Pump ON (BEPERKT) - verliestrend %.0f/%.0f min, PWM=%d", lossMinutes, LOSS_MINUTES_FULL, (int)pwmValue);
   } else {
     sprintf(str, "Pump ON (REGIME) - dT gefilterd=%.1fC PWM=%d (fout=%.1f)", dTFiltered, (int)pwmValue, dTFiltered - DT_TARGET);
   }
