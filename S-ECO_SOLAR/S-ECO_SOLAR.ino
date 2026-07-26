@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 26jul26: dEQ vereenvoudigd naar een simpele 1-staps-delta (verschil met de vorige minuut) i.p.v. het glijdend venster van 10 minuten. Reden: dEQ stuurt sinds 25jul26b niets meer aan, is dus zuiver informatief - en het venster introduceerde een nieuwe reboot-bug (een onstabiele allereerste sensormeting na het opstarten bleef 10 minuten in het venster hangen en gaf dan een absurde uitschieter, bv. dEQ=28 kWh). De simpele delta is immuun daarvoor: elke reboot start gewoon met dEQ=0 op de eerste meting, geen geheugen van vóór de herstart (Claude)
 - 25jul26b: FUNDAMENTELE VEREENVOUDIGING - de hele dEQ-gebaseerde verlies-beperking (BEPERKT-fase) is verwijderd. dEQ meet de totale boiler-energie, die evengoed daalt door bv. warmwaterverbruik - los van of de zonnelus goed werkt. dT (via de PID) geeft al een direct, ogenblikkelijk antwoord op de enige vraag die telt: is de collector nu warmer dan de boiler? Alle bugs in dit traject (deadlock, stale-read, kwantisatieruis, reboot-blinde-periode) waren symptomen van deze extra laag, niet van de kernregeling. dEQ blijft in het logblad staan (het glijdend venster van 24jul26), maar stuurt de PWM niet langer aan. De echte veiligheidsmodi (nacht, thermosifon, oververhitting, stop-hysterese, opstartdemping) blijven volledig intact (Claude)
 - 25jul26: (1) Verlies-streak vervangen door een gegradueerde reactie: een opgebouwde "verliesminuten"-teller die sneller oploopt bij een groter verlies (0,5x-3x tempo t.o.v. een typisch verlies) en het PWM-plafond geleidelijk laat zakken over ~15 minuten i.p.v. een harde knip na een vast aantal cycli - herstelt ook sneller (-3/min) zodra dEQ weer positief is. (2) Anti-windup: de PID-integraalterm wordt bevroren zolang de PWM toch al door de opstart- of verliesbegrenzing tegengehouden wordt, tegen de PWM-piek die ontstond zodra zo'n plafond wegviel. (3) Opstartfase verlengd van 4 naar 6 minuten (Claude)
 - 24jul26: dEQ herbouwd als glijdend venster van 10 minuten historiek (i.p.v. een 1x/10' snapshot). Elke minuut een verse waarde, mét de resolutie van een volledig 10-minutenvenster (vermijdt afrondingsruis van EQtot's 2 decimalen bij een korter venster). Volledig zelfstandig aan de Photon - geen enkele koppeling meer met hoe vaak Google Sheets logt, en geen "dEQFresh"-vlag meer nodig (Claude)
@@ -100,15 +101,13 @@ double celsius;
 double ETmin = 35; // Minimum ECO boiler temperature to calculate "spare" energy (Securing Hot water supply)
 double EAv1, EAv2, EAv3, EAv4, EAv5, EAv; // Average temperatures
 double EQ1, EQ2, EQ3, EQ4, EQ5, EQtot, dEQ; // Boiler energy
-// dEQ als glijdend venster van 10 minuten historiek, elke minuut vers berekend
-// (24jul26) - vermijdt zowel het "stale waarde herhaaldelijk aflezen"-probleem
-// als afrondingsruis, en is volledig onafhankelijk van de logging-frequentie
-// naar Google Sheets (die twee hebben nooit iets met elkaar te maken gehad).
-const int DEQ_WINDOW_SIZE = 10;       // minuten historiek
-double eqHistory[DEQ_WINDOW_SIZE];
-int eqHistoryCount = 0;               // hoeveel geldige samples we al hebben (max DEQ_WINDOW_SIZE)
-int eqHistoryIndex = 0;               // volgende schrijfpositie (circulair)
-bool dEQWindowReady = false;          // pas true zodra een volledig venster beschikbaar is
+// dEQ als eenvoudige 1-staps-delta t.o.v. de vorige minuut (26jul26) - dEQ is
+// sinds 25jul26b zuiver informatief (stuurt de PWM niet meer aan), dus geen
+// venster meer nodig. Simpeler én immuun voor het reboot-euvel van het
+// glijdend venster (een instabiele eerste meting na opstart die 10 minuten
+// later een absurde uitschieter gaf).
+double prevEQtot = 0;
+bool prevEQtotInit = false;
 
 // Define variables for SOLAR controller: *A7: PWM, *D2: relay
 int relayPin = D2;
@@ -257,20 +256,16 @@ void loop()
     EQ5 = (EAv5-ETmin)*110*1.163/1000;
     EQtot = EQ1+EQ2+EQ3+EQ4+EQ5;
 
-    // Glijdend venster van 10 minuten: elke minuut vers, met de resolutie van
-    // een vol 10-minutenvenster (vermijdt afrondingsruis op EQtot's 2 decimalen)
-    if (eqHistoryCount < DEQ_WINDOW_SIZE) {
-      eqHistory[eqHistoryIndex] = EQtot;
-      eqHistoryIndex = (eqHistoryIndex + 1) % DEQ_WINDOW_SIZE;
-      eqHistoryCount++;
+    // Eenvoudige 1-staps-delta t.o.v. de vorige minuut (26jul26) - zuiver
+    // informatief, stuurt niets meer aan. Op de eerste meting na een reboot
+    // (prevEQtotInit nog false) tonen we 0 i.p.v. een misleidende sprong.
+    if (!prevEQtotInit) {
+      prevEQtot = EQtot;
+      prevEQtotInit = true;
       dEQ = 0;
-      dEQWindowReady = false;   // nog geen vol venster (bv. net opgestart) - dEQ is dan enkel indicatief in het logblad
     } else {
-      double oldest = eqHistory[eqHistoryIndex];
-      dEQ = EQtot - oldest;
-      eqHistory[eqHistoryIndex] = EQtot;
-      eqHistoryIndex = (eqHistoryIndex + 1) % DEQ_WINDOW_SIZE;
-      dEQWindowReady = true;
+      dEQ = EQtot - prevEQtot;
+      prevEQtot = EQtot;
     }
 
 
