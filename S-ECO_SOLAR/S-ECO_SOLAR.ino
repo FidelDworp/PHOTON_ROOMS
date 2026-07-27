@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 27jul26: functie "manual" uitgebreid: PWM direct instellen (0...255) Command = "200" => Draait 200 en relay ON. "0" = relay off. TEST: tot PWM 10 hoor je de pomp starten en stoppen. Regeling kan dus heel laag gaan!
 - 26jul26: dEQ vereenvoudigd naar een simpele 1-staps-delta (verschil met de vorige minuut) i.p.v. het glijdend venster van 10 minuten. Reden: dEQ stuurt sinds 25jul26b niets meer aan, is dus zuiver informatief - en het venster introduceerde een nieuwe reboot-bug (een onstabiele allereerste sensormeting na het opstarten bleef 10 minuten in het venster hangen en gaf dan een absurde uitschieter, bv. dEQ=28 kWh). De simpele delta is immuun daarvoor: elke reboot start gewoon met dEQ=0 op de eerste meting, geen geheugen van vóór de herstart (Claude)
 - 25jul26b: FUNDAMENTELE VEREENVOUDIGING - de hele dEQ-gebaseerde verlies-beperking (BEPERKT-fase) is verwijderd. dEQ meet de totale boiler-energie, die evengoed daalt door bv. warmwaterverbruik - los van of de zonnelus goed werkt. dT (via de PID) geeft al een direct, ogenblikkelijk antwoord op de enige vraag die telt: is de collector nu warmer dan de boiler? Alle bugs in dit traject (deadlock, stale-read, kwantisatieruis, reboot-blinde-periode) waren symptomen van deze extra laag, niet van de kernregeling. dEQ blijft in het logblad staan (het glijdend venster van 24jul26), maar stuurt de PWM niet langer aan. De echte veiligheidsmodi (nacht, thermosifon, oververhitting, stop-hysterese, opstartdemping) blijven volledig intact (Claude)
 - 25jul26: (1) Verlies-streak vervangen door een gegradueerde reactie: een opgebouwde "verliesminuten"-teller die sneller oploopt bij een groter verlies (0,5x-3x tempo t.o.v. een typisch verlies) en het PWM-plafond geleidelijk laat zakken over ~15 minuten i.p.v. een harde knip na een vast aantal cycli - herstelt ook sneller (-3/min) zodra dEQ weer positief is. (2) Anti-windup: de PID-integraalterm wordt bevroren zolang de PWM toch al door de opstart- of verliesbegrenzing tegengehouden wordt, tegen de PWM-piek die ontstond zodra zo'n plafond wegviel. (3) Opstartfase verlengd van 4 naar 6 minuten (Claude)
@@ -579,50 +580,85 @@ void getTemperatures(int select)
 // Particle.function to remote control manually. Can also be called from the loop(): ex = manual("Report");
 int manual(String command)
 {
-  if(command == "report")
+  command.trim();
+  command.toLowerCase();
+
+  if (command == "report")
   {
-    // WiFi reception
     wifiRSSI = WiFi.RSSI();
-    sprintf(str, "wifiRSSI: %2.0f",wifiRSSI);
-    Particle.publish("Status-ROOM", str,60,PRIVATE); delay(500);
+    sprintf(str, "wifiRSSI: %d", wifiRSSI);
+    Particle.publish("Status-ROOM", str, PRIVATE); delay(500);
 
-    // Memory monitoring
-    memPERCENT = (freemem/51944)*100;
-    sprintf(str, "Freememory + MemPct: %2.0f + %2.0f",freemem,memPERCENT);
-    Particle.publish("Status-ROOM", str,60,PRIVATE); delay(500);
+    memPERCENT = (freemem * 100) / 82944;
+    sprintf(str, "FreeMem: %d  Mem:%d%%", freemem, memPERCENT);
+    Particle.publish("Status-ROOM", str, PRIVATE); delay(500);
 
-    // Boiler energy & temps
-    Particle.publish("Solar", JSON_temperat,60,PRIVATE); delay(500);
-    // Sensor IDs
+    Particle.publish("Solar", JSON_temperat, PRIVATE); delay(500);
+
     discoverOneWireDevices();
 
     return 1000;
   }
 
-  if(command == "on")
+  if (command == "on")
   {
     digitalWrite(relayPin, LOW);
-    relayState = true; relay = 1;
-    sprintf(str, "Pump relay ON (Manual)");
-    Particle.publish("Solar", str);
+    relayState = true;
+    relay = 1;
+    pwmValue = 255;
+    analogWrite(pwmPin, 255);
+
+    Particle.publish("Solar", "Pump MANUAL ON (PWM=255)", PRIVATE);
     return 255;
   }
 
-  if(command == "off")
+  if (command == "off")
   {
-    digitalWrite(relayPin, LOW);
-    relayState = false; relay = 0;
-    sprintf(str, "Pump relay OFF (Manual)");
-    Particle.publish("Solar", str);
+    digitalWrite(relayPin, HIGH);
+    relayState = false;
+    relay = 0;
+    pwmValue = 0;
+    analogWrite(pwmPin, 0);
+
+    Particle.publish("Solar", "Pump MANUAL OFF", PRIVATE);
     return 0;
   }
 
-  if(command == "reset") // You can remotely RESET the photon with this command...
+  if (command == "reset")
   {
     System.reset();
     return -10000;
   }
 
-  Particle.publish("Solar", command,60,PRIVATE);// If it does not match one of the above, publish the received string to see what it's "payload" was...
-  return -1;// If none above
+  // ===== PWM direct instellen (0...255) Command = "200" => Draait 200 en relay ON. "0" = relay off
+  int pwm = command.toInt();
+
+  if (command == String(pwm) && pwm >= 0 && pwm <= 255)
+  {
+    pwmValue = pwm;
+
+    if (pwm == 0)
+    {
+      digitalWrite(relayPin, HIGH);
+      relayState = false;
+      relay = 0;
+    }
+    else
+    {
+      digitalWrite(relayPin, LOW);
+      relayState = true;
+      relay = 1;
+    }
+
+    analogWrite(pwmPin, pwm);
+
+    sprintf(str, "Pump MANUAL PWM=%d", pwm);
+    Particle.publish("Solar", str, PRIVATE);
+
+    return pwm;
+  }
+
+  Particle.publish("Solar", command, PRIVATE);
+  return -1;
 }
+
