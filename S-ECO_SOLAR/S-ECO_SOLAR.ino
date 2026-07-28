@@ -1,7 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
-- 27jul26: functie "manual" uitgebreid: PWM direct instellen (0...255) Command = "200" => Draait 200 en relay ON. "0" = relay off. TEST: tot PWM 10 hoor je de pomp starten en stoppen. Regeling kan dus heel laag gaan!
+- 28jul26: FUNDAMENTELE HERBOUW naar 5 fasen, gebaseerd op een reële hardwaretest (PWM=10 bevestigd bruikbaar): (1) OPSTART is nu een echte open-lus ramp (20→30→40 over 3'), niet langer een PID-uitvoer die enkel begrensd werd - vermijdt dat de PID al vanaf de eerste seconde reageert op de ruizige "hete-plug"-transiënt. (2) PWM_MIN drastisch verlaagd naar 15 (cruise-bodem, apart van de opstart-ramp). (3) PID fors rustiger afgesteld (Kp 8→3, Ki 0.6→0.15, Kd 3→0) - de vorige agressieve gains waren de eigenlijke bron van de meeste overshoots die we tot nu toe bestreden met lapmiddelen. (4) DT_TARGET verlaagd naar 1.8°C en DT_START naar 2.0°C - Tsol moet enkel nog kort boven de boilertemperatuur blijven, niet een vaste marge. (5) STOP herdacht als laatste redmiddel: de relay schakelt pas uit nadat de PID al minstens 5' onafgebroken op PWM_MIN staat zonder herstel (nieuwe fase AFBOUW), i.p.v. bij één enkele meting onder een vaste drempel. Nachtblokkering, thermosifon en oververhitting ongewijzigd (Claude, na overleg met ChatGPT-analyse van de gebruiker)
 - 26jul26: dEQ vereenvoudigd naar een simpele 1-staps-delta (verschil met de vorige minuut) i.p.v. het glijdend venster van 10 minuten. Reden: dEQ stuurt sinds 25jul26b niets meer aan, is dus zuiver informatief - en het venster introduceerde een nieuwe reboot-bug (een onstabiele allereerste sensormeting na het opstarten bleef 10 minuten in het venster hangen en gaf dan een absurde uitschieter, bv. dEQ=28 kWh). De simpele delta is immuun daarvoor: elke reboot start gewoon met dEQ=0 op de eerste meting, geen geheugen van vóór de herstart (Claude)
 - 25jul26b: FUNDAMENTELE VEREENVOUDIGING - de hele dEQ-gebaseerde verlies-beperking (BEPERKT-fase) is verwijderd. dEQ meet de totale boiler-energie, die evengoed daalt door bv. warmwaterverbruik - los van of de zonnelus goed werkt. dT (via de PID) geeft al een direct, ogenblikkelijk antwoord op de enige vraag die telt: is de collector nu warmer dan de boiler? Alle bugs in dit traject (deadlock, stale-read, kwantisatieruis, reboot-blinde-periode) waren symptomen van deze extra laag, niet van de kernregeling. dEQ blijft in het logblad staan (het glijdend venster van 24jul26), maar stuurt de PWM niet langer aan. De echte veiligheidsmodi (nacht, thermosifon, oververhitting, stop-hysterese, opstartdemping) blijven volledig intact (Claude)
 - 25jul26: (1) Verlies-streak vervangen door een gegradueerde reactie: een opgebouwde "verliesminuten"-teller die sneller oploopt bij een groter verlies (0,5x-3x tempo t.o.v. een typisch verlies) en het PWM-plafond geleidelijk laat zakken over ~15 minuten i.p.v. een harde knip na een vast aantal cycli - herstelt ook sneller (-3/min) zodra dEQ weer positief is. (2) Anti-windup: de PID-integraalterm wordt bevroren zolang de PWM toch al door de opstart- of verliesbegrenzing tegengehouden wordt, tegen de PWM-piek die ontstond zodra zo'n plafond wegviel. (3) Opstartfase verlengd van 4 naar 6 minuten (Claude)
@@ -122,18 +122,19 @@ double dT = Tsun - Tboil;
 double Hysteresis = 1;
 double pwmValue = 0; // 0-255 (Use double to calculate)
 
-// PID-regelaar voor pompsnelheid (vervangt drempel+ramp), 14jul26b
-double DT_TARGET = 2.5;          // gewenste dT-evenwicht i.p.v. aan/uit-cyclus
-double DT_START  = 3.0;          // drempel om de pomp te starten vanuit stilstand
-double DT_STOP   = 0.5;          // drempel om de pomp volledig te stoppen (relay uit)
-double Kp = 8.0;
-double Ki = 0.6;
-double Kd = 3.0;
+// PID-regelaar voor pompsnelheid, 14jul26b - rustiger afgesteld op 28jul26
+// na een reële hardwaretest die bevestigde dat de pomp betrouwbaar draait tot PWM=15
+double DT_TARGET = 1.8;          // gewenste dT-evenwicht: Tsol moet net boven de boiler blijven
+double DT_START  = 2.0;          // drempel om de pomp te starten vanuit stilstand
+double DT_HARD_STOP = 0.0;       // "geen winst meer"-drempel, enkel relevant i.c.m. PWM_MIN hieronder
+double Kp = 3.0;
+double Ki = 0.15;
+double Kd = 0.0;
 double pidIntegral = 0;
 double pidPrevError = 0;
 const double PID_I_MAX = 50.0;   // anti-windup clamp op de integraalterm
-double PWM_MIN_RUN = 60;         // ondergrens PWM zolang de pomp draait
-double PWM_RAMP_STEP = 60;       // extra veiligheidslimiet: max PWM-verandering per minuut, bovenop de PID
+double PWM_MIN = 15;             // cruise-bodem waarnaar de PID mag zakken (hardware-getest)
+double PWM_MAX_DELTA_PER_MIN = 60;  // extra veiligheidslimiet: max PWM-verandering per minuut, bovenop de PID
 unsigned long pumpStartTime = 0;
 unsigned long lastPidTime = 0;
 
@@ -142,11 +143,15 @@ double dTFiltered = 0;
 bool dTFilterInit = false;
 const double DT_FILTER_ALPHA = 0.3;  // per minuut; lager = trager/gladder, hoger = reageert sneller
 
-// Fase-gebaseerde overgangsdemping tegen zware overshoots bij dagbegin/-einde, 17jul26/25jul26
-const unsigned long SOFT_START_MIN = 6;   // minuten na pompstart dat PWM begrensd blijft
-double SOFT_START_PWM_CAP = 90;           // PWM-grens tijdens opstartfase
-int belowStopCount = 0;
-const int STOP_DEBOUNCE_CYCLES = 2;       // aantal opeenvolgende cycli onder DT_STOP vooraleer echt te stoppen
+// 5-fasen-ontwerp, 28jul26: OPSTART is nu een echte open-lus ramp (niet de PID zelf),
+// en STOP is een laatste redmiddel na aanhoudend falen op de PWM-bodem (fase AFBOUW)
+const double PWM_RAMP_START = 20;            // begin-PWM bij pompstart
+const double PWM_RAMP_STEP_PER_MIN = 10;     // toename per minuut tijdens de opstart-ramp
+const unsigned long PWM_RAMP_DURATION_MIN = 3;  // duur van de ramp-fase
+const double PWM_RAMP_CEILING = 60;          // veilig plafond tijdens de ramp zelf
+double floorMinutes = 0;                     // hoeveel minuten aan een stuk op PWM_MIN zonder herstel
+const double STOP_PATIENCE_MIN = 5.0;        // pas na zoveel minuten op de bodem schakelt de relay echt uit
+
 
 // Define timer to call solarPump function
 const unsigned long pumpInterval = 1 * 60 * 1000;
@@ -346,15 +351,12 @@ void solarPump() {
     relayState = false; relay = 0; pwmValue = 0;
     sprintf(str, "Pump OFF - Nachtblokkering");
     analogWrite(pwmPin, 0);
-    belowStopCount = 0;
+    floorMinutes = 0;
     pidIntegral = 0; pidPrevError = 0;
     return;
   }
 
   // dT-filter (EMA): dempt de korte, hevige piek van de "hete plug" bij pompstart
-  // (dT schoot voorheen naar 18-40°C op en stortte een minuut later in - een
-  // meetartefact, geen echt duurzaam warmteoverschot). Hysterese én PID werken
-  // hierna met dTFiltered i.p.v. de ruwe dT.
   if (!dTFilterInit) {
     dTFiltered = dT;
     dTFilterInit = true;
@@ -362,26 +364,40 @@ void solarPump() {
     dTFiltered += DT_FILTER_ALPHA * (dT - dTFiltered);
   }
 
-  // Hysterese voor de relay zelf, met debounce op de stop-kant: pas echt stoppen
-  // na STOP_DEBOUNCE_CYCLES opeenvolgende metingen onder DT_STOP. Dempt het
-  // geflipper 's avonds wanneer dT lang rond de drempel blijft hangen.
-  bool shouldBeOn;
-  if (relayState) {
-    if (dTFiltered > DT_STOP) {
-      shouldBeOn = true;
-      belowStopCount = 0;
-    } else {
-      belowStopCount++;
-      shouldBeOn = (belowStopCount < STOP_DEBOUNCE_CYCLES);
-    }
-  } else {
-    shouldBeOn = (dTFiltered > DT_START);
-    belowStopCount = 0;
+  unsigned long nowMs = millis();
+  double dtMin = 1.0;  // tijd sinds vorige cyclus, in minuten (enkel zinvol als de pomp al draaide)
+  if (relayState && lastPidTime > 0) {
+    dtMin = (double)(nowMs - lastPidTime) / 60000.0;
+    if (dtMin <= 0) dtMin = 1.0;
   }
 
-  // Thermosifon blokkeren: voorkomt terugstroming/afkoeling bij lage Tsun
+  // --- STOP als laatste redmiddel (28jul26) ---
+  // De relay schakelt niet meer uit bij één enkele meting onder een vaste drempel.
+  // In plaats daarvan: zolang de PID op de PWM-bodem (PWM_MIN) staat ÉN dT niet meer
+  // wint, loopt een teller op; pas na STOP_PATIENCE_MIN minuten aan een stuk zonder
+  // herstel stopt de pomp echt. Zo krijgt elke tijdelijke dip de kans om vanzelf te
+  // herstellen zonder de pomp af te breken (en dus een nieuwe "hete-plug"-herstart
+  // te veroorzaken).
+  bool shouldBeOn;
+  bool atFloor = false;
+  if (relayState) {
+    atFloor = (pwmValue <= PWM_MIN + 2.0);
+    bool tooLow = (dTFiltered <= DT_HARD_STOP);
+    if (atFloor && tooLow) {
+      floorMinutes += dtMin;
+    } else {
+      floorMinutes = 0;
+    }
+    shouldBeOn = (floorMinutes < STOP_PATIENCE_MIN);
+  } else {
+    shouldBeOn = (dTFiltered > DT_START);
+    floorMinutes = 0;
+  }
+
+  // Thermosifon blokkeren: voorkomt terugstroming/afkoeling bij lage Tsun (directe override)
   if (dTFiltered > DT_START && Tsun < 22.0) {
     shouldBeOn = false;
+    floorMinutes = 0;
     sprintf(str, "Pump OFF - Thermosifon (Tsun=%.1fC)", Tsun);
   }
 
@@ -390,39 +406,37 @@ void solarPump() {
   bool overheat = (Tsun >= 90.0);
   if (overheat) {
     shouldBeOn = true;
+    floorMinutes = 0;
   }
 
   if (!shouldBeOn) {
-    if (relayState) sprintf(str, "Pump OFF - dT gefilterd=%.1fC <= stopdrempel", dTFiltered);
+    if (relayState) sprintf(str, "Pump OFF - dT gefilterd=%.1fC, geen herstel na %.0f min op PWM-bodem", dTFiltered, STOP_PATIENCE_MIN);
     digitalWrite(relayPin, HIGH);
     relayState = false; relay = 0;
     pwmValue = 0;
     pidIntegral = 0;      // reset zodat er geen windup optreedt terwijl de pomp stilstaat
     pidPrevError = 0;
-    belowStopCount = 0;
+    floorMinutes = 0;
+    lastPidTime = 0;      // volgende start telt weer vers vanaf dtMin=1
     analogWrite(pwmPin, 0);
     return;
   }
 
-  // --- Pomp is/wordt AAN: PID regelt de snelheid rond DT_TARGET ---
-  unsigned long nowMs = millis();
-  double dtMin = 1.0;  // tijd sinds vorige PID-stap, in minuten
+  // --- Pomp is/wordt AAN ---
   bool justStarted = !relayState;
 
   if (justStarted) {
     pumpStartTime = nowMs;
     pidIntegral = 0;
     pidPrevError = dTFiltered - DT_TARGET;   // voorkomt een D-piek bij de allereerste stap
-  } else if (lastPidTime > 0) {
-    dtMin = (double)(nowMs - lastPidTime) / 60000.0;
-    if (dtMin <= 0) dtMin = 1.0;
+    floorMinutes = 0;
   }
   lastPidTime = nowMs;
 
   digitalWrite(relayPin, LOW);
   relayState = true; relay = 1;
 
-  bool inSoftStart = (nowMs - pumpStartTime) < (SOFT_START_MIN * 60000UL);
+  bool inRamp = (nowMs - pumpStartTime) < (PWM_RAMP_DURATION_MIN * 60000UL);
 
   double pwmDoel;
 
@@ -430,41 +444,43 @@ void solarPump() {
     pwmDoel = 255;
   } else if (Tsun > 75.0) {
     pwmDoel = 180;
+  } else if (inRamp) {
+    // OPSTART: een echte open-lus ramp, losgekoppeld van de PID. Zo reageert de
+    // regelaar niet al vanaf de eerste seconde op de ruizige "hete-plug"-transiënt.
+    double minutesSinceStart = (double)(nowMs - pumpStartTime) / 60000.0;
+    pwmDoel = PWM_RAMP_START + PWM_RAMP_STEP_PER_MIN * minutesSinceStart;
+    pwmDoel = constrain(pwmDoel, PWM_RAMP_START, PWM_RAMP_CEILING);
   } else {
     double error = dTFiltered - DT_TARGET;
 
-    // Anti-windup: de integraalterm bevriezen tijdens de opstartfase, tegen de
-    // PWM-piek die ontstond zodra dat plafond wegviel.
-    if (!inSoftStart) {
+    // Anti-windup: integraal bevriezen zolang de PWM toch al op de bodem
+    // vastzit - anders stapelt de integraal zich nutteloos verder op.
+    if (!atFloor) {
       pidIntegral = constrain(pidIntegral + error * dtMin, -PID_I_MAX, PID_I_MAX);
     }
     double derivative = (error - pidPrevError) / dtMin;
     pidPrevError = error;
 
     double pidOutput = (Kp * error) + (Ki * pidIntegral) + (Kd * derivative);
-    pwmDoel = constrain(PWM_MIN_RUN + pidOutput, PWM_MIN_RUN, 255);
-
-    // Opstartfase: PWM hard begrensd, ongeacht wat de PID wil - geeft de
-    // "hete plug" tijd om weg te stromen vóór de PID volledig overneemt.
-    if (inSoftStart) {
-      pwmDoel = min(pwmDoel, SOFT_START_PWM_CAP);
-    }
+    pwmDoel = constrain(PWM_MIN + pidOutput, PWM_MIN, 255);
   }
 
   // Extra veiligheidslimiet bovenop de PID: max verandering per minuut
   if (overheat) {
     pwmValue = pwmDoel;
   } else if (pwmValue < pwmDoel) {
-    pwmValue = min(pwmValue + PWM_RAMP_STEP * dtMin, pwmDoel);
+    pwmValue = min(pwmValue + PWM_MAX_DELTA_PER_MIN * dtMin, pwmDoel);
   } else if (pwmValue > pwmDoel) {
-    pwmValue = max(pwmValue - PWM_RAMP_STEP * dtMin, pwmDoel);
+    pwmValue = max(pwmValue - PWM_MAX_DELTA_PER_MIN * dtMin, pwmDoel);
   }
 
   // Status: geeft altijd exact de actieve fase weer
   if (overheat) {
     sprintf(str, "Pump ON (OVERVERHIT) - Tsun=%.1fC >= 90C, PWM=255", Tsun);
-  } else if (inSoftStart) {
-    sprintf(str, "Pump ON (OPSTART) - dT gefilterd=%.1fC, PWM begrensd op %d", dTFiltered, (int)SOFT_START_PWM_CAP);
+  } else if (inRamp) {
+    sprintf(str, "Pump ON (OPSTART) - dT gefilterd=%.1fC, ramp PWM=%d", dTFiltered, (int)pwmValue);
+  } else if (atFloor) {
+    sprintf(str, "Pump ON (AFBOUW) - dT gefilterd=%.1fC, PWM-bodem sinds %.1f/%.0f min", dTFiltered, floorMinutes, STOP_PATIENCE_MIN);
   } else {
     sprintf(str, "Pump ON (REGIME) - dT gefilterd=%.1fC PWM=%d (fout=%.1f)", dTFiltered, (int)pwmValue, dTFiltered - DT_TARGET);
   }
@@ -580,85 +596,50 @@ void getTemperatures(int select)
 // Particle.function to remote control manually. Can also be called from the loop(): ex = manual("Report");
 int manual(String command)
 {
-  command.trim();
-  command.toLowerCase();
-
-  if (command == "report")
+  if(command == "report")
   {
+    // WiFi reception
     wifiRSSI = WiFi.RSSI();
-    sprintf(str, "wifiRSSI: %d", wifiRSSI);
-    Particle.publish("Status-ROOM", str, PRIVATE); delay(500);
+    sprintf(str, "wifiRSSI: %2.0f",wifiRSSI);
+    Particle.publish("Status-ROOM", str,60,PRIVATE); delay(500);
 
-    memPERCENT = (freemem * 100) / 82944;
-    sprintf(str, "FreeMem: %d  Mem:%d%%", freemem, memPERCENT);
-    Particle.publish("Status-ROOM", str, PRIVATE); delay(500);
+    // Memory monitoring
+    memPERCENT = (freemem/51944)*100;
+    sprintf(str, "Freememory + MemPct: %2.0f + %2.0f",freemem,memPERCENT);
+    Particle.publish("Status-ROOM", str,60,PRIVATE); delay(500);
 
-    Particle.publish("Solar", JSON_temperat, PRIVATE); delay(500);
-
+    // Boiler energy & temps
+    Particle.publish("Solar", JSON_temperat,60,PRIVATE); delay(500);
+    // Sensor IDs
     discoverOneWireDevices();
 
     return 1000;
   }
 
-  if (command == "on")
+  if(command == "on")
   {
     digitalWrite(relayPin, LOW);
-    relayState = true;
-    relay = 1;
-    pwmValue = 255;
-    analogWrite(pwmPin, 255);
-
-    Particle.publish("Solar", "Pump MANUAL ON (PWM=255)", PRIVATE);
+    relayState = true; relay = 1;
+    sprintf(str, "Pump relay ON (Manual)");
+    Particle.publish("Solar", str);
     return 255;
   }
 
-  if (command == "off")
+  if(command == "off")
   {
-    digitalWrite(relayPin, HIGH);
-    relayState = false;
-    relay = 0;
-    pwmValue = 0;
-    analogWrite(pwmPin, 0);
-
-    Particle.publish("Solar", "Pump MANUAL OFF", PRIVATE);
+    digitalWrite(relayPin, LOW);
+    relayState = false; relay = 0;
+    sprintf(str, "Pump relay OFF (Manual)");
+    Particle.publish("Solar", str);
     return 0;
   }
 
-  if (command == "reset")
+  if(command == "reset") // You can remotely RESET the photon with this command...
   {
     System.reset();
     return -10000;
   }
 
-  // ===== PWM direct instellen (0...255) Command = "200" => Draait 200 en relay ON. "0" = relay off
-  int pwm = command.toInt();
-
-  if (command == String(pwm) && pwm >= 0 && pwm <= 255)
-  {
-    pwmValue = pwm;
-
-    if (pwm == 0)
-    {
-      digitalWrite(relayPin, HIGH);
-      relayState = false;
-      relay = 0;
-    }
-    else
-    {
-      digitalWrite(relayPin, LOW);
-      relayState = true;
-      relay = 1;
-    }
-
-    analogWrite(pwmPin, pwm);
-
-    sprintf(str, "Pump MANUAL PWM=%d", pwm);
-    Particle.publish("Solar", str, PRIVATE);
-
-    return pwm;
-  }
-
-  Particle.publish("Solar", command, PRIVATE);
-  return -1;
+  Particle.publish("Solar", command,60,PRIVATE);// If it does not match one of the above, publish the received string to see what it's "payload" was...
+  return -1;// If none above
 }
-
