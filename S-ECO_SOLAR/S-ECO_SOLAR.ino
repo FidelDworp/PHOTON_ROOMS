@@ -1,6 +1,8 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 29jul26c: De vaste "Tsun>75°C → PWM=180"-override verwijderd. Een volledige dag data toonde een griezelig regelmatige zaagtand van precies 11 minuten, telkens crashend exact op het moment dat Tsol de 75°C overschreed: de PID volgde daarvoor keurig geleidelijk (bv. PWM 30→74 terwijl dT van 4→14°C steeg), maar de vaste override sloeg dan in één klap naar 180 - een sprong volledig losgekoppeld van wat de PID net aan het opbouwen was, wat de collector telkens liet crashen. Enkel de échte noodstop (Tsun>=90°C → PWM=255) blijft als vaste override staan; de PID regelt nu ook het hele bereik tussen 75-90°C zelf (Claude)
+- 29jul26b: ROOT CAUSE gevonden voor de aanhoudende PWM-pendeling: niet de PID-gains (die van 29jul26a waren correct), maar de PWM_MAX_DELTA_PER_MIN-veiligheidslimiet (60/min) die tijdens REGIME de PID's eigen, correct berekende snellere respons afremde. Data toonde exacte +60-sprongen (40→100, 85→145) terwijl de PID intussen al veel hoger wilde (cmd=168, 145) - dT liep intussen ongestoord door tot 35°C. Verhoogd naar 150/min: de opstartfase gebruikt sowieso haar eigen aparte trage ramp (10/min) en bindt hier nooit, Kd dempt de invoer al via dTFiltered (Claude)
 - 29jul26: PID-gains bijgesteld na een felle-ochtendtest: Kp 3→4 (te traag om een snel opkomende zon bij te benen - dT liep tot 40°C op vooraleer de Tsun>75-override ingreep) en Kd 0→1.2 toegevoegd (reageert op de sNELHEID van de verandering, niet enkel de grootte - vangt een snelle stijging vroeger op dan Kp alleen kan, zonder de jitter-gevoeligheid die Kd oorspronkelijk deed uitschakelen, want hij werkt op dTFiltered, niet de ruwe dT). Ook een logging-bug in de shadow gefixt (comment toonde "fout=0.0" tijdens de Tsun>75-override) (Claude)
 - 28jul26: FUNDAMENTELE HERBOUW naar 5 fasen, gebaseerd op een reële hardwaretest (PWM=10 bevestigd bruikbaar): (1) OPSTART is nu een echte open-lus ramp (20→30→40 over 3'), niet langer een PID-uitvoer die enkel begrensd werd - vermijdt dat de PID al vanaf de eerste seconde reageert op de ruizige "hete-plug"-transiënt. (2) PWM_MIN drastisch verlaagd naar 15 (cruise-bodem, apart van de opstart-ramp). (3) PID fors rustiger afgesteld (Kp 8→3, Ki 0.6→0.15, Kd 3→0) - de vorige agressieve gains waren de eigenlijke bron van de meeste overshoots die we tot nu toe bestreden met lapmiddelen. (4) DT_TARGET verlaagd naar 1.8°C en DT_START naar 2.0°C - Tsol moet enkel nog kort boven de boilertemperatuur blijven, niet een vaste marge. (5) STOP herdacht als laatste redmiddel: de relay schakelt pas uit nadat de PID al minstens 5' onafgebroken op PWM_MIN staat zonder herstel (nieuwe fase AFBOUW), i.p.v. bij één enkele meting onder een vaste drempel. Nachtblokkering, thermosifon en oververhitting ongewijzigd (Claude, na overleg met ChatGPT-analyse van de gebruiker)
 - 26jul26: dEQ vereenvoudigd naar een simpele 1-staps-delta (verschil met de vorige minuut) i.p.v. het glijdend venster van 10 minuten. Reden: dEQ stuurt sinds 25jul26b niets meer aan, is dus zuiver informatief - en het venster introduceerde een nieuwe reboot-bug (een onstabiele allereerste sensormeting na het opstarten bleef 10 minuten in het venster hangen en gaf dan een absurde uitschieter, bv. dEQ=28 kWh). De simpele delta is immuun daarvoor: elke reboot start gewoon met dEQ=0 op de eerste meting, geen geheugen van vóór de herstart (Claude)
@@ -135,7 +137,7 @@ double pidIntegral = 0;
 double pidPrevError = 0;
 const double PID_I_MAX = 50.0;   // anti-windup clamp op de integraalterm
 double PWM_MIN = 15;             // cruise-bodem waarnaar de PID mag zakken (hardware-getest)
-double PWM_MAX_DELTA_PER_MIN = 60;  // extra veiligheidslimiet: max PWM-verandering per minuut, bovenop de PID
+double PWM_MAX_DELTA_PER_MIN = 150;  // extra veiligheidslimiet: max PWM-verandering per minuut, bovenop de PID (29jul26b: 60→150, was de facto de bottleneck tijdens REGIME)
 unsigned long pumpStartTime = 0;
 unsigned long lastPidTime = 0;
 
@@ -443,8 +445,6 @@ void solarPump() {
 
   if (overheat) {
     pwmDoel = 255;
-  } else if (Tsun > 75.0) {
-    pwmDoel = 180;
   } else if (inRamp) {
     // OPSTART: een echte open-lus ramp, losgekoppeld van de PID. Zo reageert de
     // regelaar niet al vanaf de eerste seconde op de ruizige "hete-plug"-transiënt.
