@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 29jul26: PID-gains bijgesteld na een felle-ochtendtest: Kp 3→4 (te traag om een snel opkomende zon bij te benen - dT liep tot 40°C op vooraleer de Tsun>75-override ingreep) en Kd 0→1.2 toegevoegd (reageert op de sNELHEID van de verandering, niet enkel de grootte - vangt een snelle stijging vroeger op dan Kp alleen kan, zonder de jitter-gevoeligheid die Kd oorspronkelijk deed uitschakelen, want hij werkt op dTFiltered, niet de ruwe dT). Ook een logging-bug in de shadow gefixt (comment toonde "fout=0.0" tijdens de Tsun>75-override) (Claude)
 - 28jul26: FUNDAMENTELE HERBOUW naar 5 fasen, gebaseerd op een reële hardwaretest (PWM=10 bevestigd bruikbaar): (1) OPSTART is nu een echte open-lus ramp (20→30→40 over 3'), niet langer een PID-uitvoer die enkel begrensd werd - vermijdt dat de PID al vanaf de eerste seconde reageert op de ruizige "hete-plug"-transiënt. (2) PWM_MIN drastisch verlaagd naar 15 (cruise-bodem, apart van de opstart-ramp). (3) PID fors rustiger afgesteld (Kp 8→3, Ki 0.6→0.15, Kd 3→0) - de vorige agressieve gains waren de eigenlijke bron van de meeste overshoots die we tot nu toe bestreden met lapmiddelen. (4) DT_TARGET verlaagd naar 1.8°C en DT_START naar 2.0°C - Tsol moet enkel nog kort boven de boilertemperatuur blijven, niet een vaste marge. (5) STOP herdacht als laatste redmiddel: de relay schakelt pas uit nadat de PID al minstens 5' onafgebroken op PWM_MIN staat zonder herstel (nieuwe fase AFBOUW), i.p.v. bij één enkele meting onder een vaste drempel. Nachtblokkering, thermosifon en oververhitting ongewijzigd (Claude, na overleg met ChatGPT-analyse van de gebruiker)
 - 26jul26: dEQ vereenvoudigd naar een simpele 1-staps-delta (verschil met de vorige minuut) i.p.v. het glijdend venster van 10 minuten. Reden: dEQ stuurt sinds 25jul26b niets meer aan, is dus zuiver informatief - en het venster introduceerde een nieuwe reboot-bug (een onstabiele allereerste sensormeting na het opstarten bleef 10 minuten in het venster hangen en gaf dan een absurde uitschieter, bv. dEQ=28 kWh). De simpele delta is immuun daarvoor: elke reboot start gewoon met dEQ=0 op de eerste meting, geen geheugen van vóór de herstart (Claude)
 - 25jul26b: FUNDAMENTELE VEREENVOUDIGING - de hele dEQ-gebaseerde verlies-beperking (BEPERKT-fase) is verwijderd. dEQ meet de totale boiler-energie, die evengoed daalt door bv. warmwaterverbruik - los van of de zonnelus goed werkt. dT (via de PID) geeft al een direct, ogenblikkelijk antwoord op de enige vraag die telt: is de collector nu warmer dan de boiler? Alle bugs in dit traject (deadlock, stale-read, kwantisatieruis, reboot-blinde-periode) waren symptomen van deze extra laag, niet van de kernregeling. dEQ blijft in het logblad staan (het glijdend venster van 24jul26), maar stuurt de PWM niet langer aan. De echte veiligheidsmodi (nacht, thermosifon, oververhitting, stop-hysterese, opstartdemping) blijven volledig intact (Claude)
@@ -127,9 +128,9 @@ double pwmValue = 0; // 0-255 (Use double to calculate)
 double DT_TARGET = 1.8;          // gewenste dT-evenwicht: Tsol moet net boven de boiler blijven
 double DT_START  = 2.0;          // drempel om de pomp te starten vanuit stilstand
 double DT_HARD_STOP = 0.0;       // "geen winst meer"-drempel, enkel relevant i.c.m. PWM_MIN hieronder
-double Kp = 3.0;
+double Kp = 4.0;
 double Ki = 0.15;
-double Kd = 0.0;
+double Kd = 1.2;
 double pidIntegral = 0;
 double pidPrevError = 0;
 const double PID_I_MAX = 50.0;   // anti-windup clamp op de integraalterm
@@ -677,4 +678,3 @@ int manual(String command)
   Particle.publish("Solar", command, PRIVATE);
   return -1;
 }
-
