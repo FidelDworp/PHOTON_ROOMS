@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 31jul26: Volledig terug naar het bewezen 17jul26-werkpunt, niet enkel de gains: DT_TARGET 1,8→2,5, DT_START 2,0→3,0, Kp 6→8, Ki 0,5→0,6 (Kd blijft 1,2). Een volledige dag data (10u-16u, 23 herhalingen van dezelfde ~10-minuten-cyclus) toonde dat de PID-verzwakking van 30jul26 het probleem niet oploste - het patroon herhaalde zich ook middenin aaneengesloten REGIME-periodes, niet enkel na een herstart, wat wijst op een structureel te krap werkpunt rond een DT_TARGET/DT_HARD_STOP die te dicht bij elkaar liggen, niet enkel op de PID-sterkte. Daarnaast de D-kick-bug hier alsnog gefixt (pidPrevError bevroor tijdens de OPSTART-ramp) - eerder al gevonden en gefixt in de simulator, maar nooit teruggeport naar deze echte sketch (Claude)
 - 30jul26: PID-gains dichter bij de oorspronkelijke, bewezen 17jul26-instelling gebracht: Kp 4→6, Ki 0,15→0,5 (Kd blijft 1,2). Data toonde dat de verzwakking van 28jul26 (Kp 8→3/4, Ki 0,6→0,15) niet de eigenlijke overshoot-oorzaak wegnam (die bleek de vaste Tsun>75-override en de "hete-plug"-transiënt na herstart te zijn, ondertussen apart aangepakt), maar wél de strakke vergrendeling rond DT_TARGET kapotmaakte die op 17jul26 acht uur lang standhield (dT 2,3-2,7°C). Vooral Ki was te zwak om kleine afwijkingen actief terug te duwen, vandaar de trage "ademhaling" (dT dreef traag weg tot 15-20°C en terug) i.p.v. een echte lock. Kp niet meteen terug naar de volle 8, om niet te overdrijven samen met de ondertussen toegevoegde Kd=1,2 (die er op 17jul26 nog niet was) (Claude)
 - 29jul26c: De vaste "Tsun>75°C → PWM=180"-override verwijderd. Een volledige dag data toonde een griezelig regelmatige zaagtand van precies 11 minuten, telkens crashend exact op het moment dat Tsol de 75°C overschreed: de PID volgde daarvoor keurig geleidelijk (bv. PWM 30→74 terwijl dT van 4→14°C steeg), maar de vaste override sloeg dan in één klap naar 180 - een sprong volledig losgekoppeld van wat de PID net aan het opbouwen was, wat de collector telkens liet crashen. Enkel de échte noodstop (Tsun>=90°C → PWM=255) blijft als vaste override staan; de PID regelt nu ook het hele bereik tussen 75-90°C zelf (Claude)
 - 29jul26b: ROOT CAUSE gevonden voor de aanhoudende PWM-pendeling: niet de PID-gains (die van 29jul26a waren correct), maar de PWM_MAX_DELTA_PER_MIN-veiligheidslimiet (60/min) die tijdens REGIME de PID's eigen, correct berekende snellere respons afremde. Data toonde exacte +60-sprongen (40→100, 85→145) terwijl de PID intussen al veel hoger wilde (cmd=168, 145) - dT liep intussen ongestoord door tot 35°C. Verhoogd naar 150/min: de opstartfase gebruikt sowieso haar eigen aparte trage ramp (10/min) en bindt hier nooit, Kd dempt de invoer al via dTFiltered (Claude)
@@ -128,11 +129,11 @@ double pwmValue = 0; // 0-255 (Use double to calculate)
 
 // PID-regelaar voor pompsnelheid, 14jul26b - rustiger afgesteld op 28jul26
 // na een reële hardwaretest die bevestigde dat de pomp betrouwbaar draait tot PWM=15
-double DT_TARGET = 1.8;          // gewenste dT-evenwicht: Tsol moet net boven de boiler blijven
-double DT_START  = 2.0;          // drempel om de pomp te starten vanuit stilstand
+double DT_TARGET = 2.5;          // gewenste dT-evenwicht: Tsol moet net boven de boiler blijven
+double DT_START  = 3.0;          // drempel om de pomp te starten vanuit stilstand
 double DT_HARD_STOP = 0.0;       // "geen winst meer"-drempel, enkel relevant i.c.m. PWM_MIN hieronder
-double Kp = 6.0;
-double Ki = 0.5;
+double Kp = 8.0;
+double Ki = 0.6;
 double Kd = 1.2;
 double pidIntegral = 0;
 double pidPrevError = 0;
@@ -452,6 +453,13 @@ void solarPump() {
     double minutesSinceStart = (double)(nowMs - pumpStartTime) / 60000.0;
     pwmDoel = PWM_RAMP_START + PWM_RAMP_STEP_PER_MIN * minutesSinceStart;
     pwmDoel = constrain(pwmDoel, PWM_RAMP_START, PWM_RAMP_CEILING);
+    // Belangrijk (31jul26): pidPrevError blijft ook tijdens de ramp elke minuut
+    // meelopen. Zonder dit zou de D-term bij de eerste REGIME-stap na de ramp
+    // een kunstmatige piek zien (vergelijking met een fout van 3 minuten
+    // geleden i.p.v. de vorige minuut), die groeit mét Kd - het omgekeerde van
+    // wat een D-term hoort te doen. Gevonden en eerst gefixt in de simulator,
+    // hier teruggeport naar de echte sketch.
+    pidPrevError = dTFiltered - DT_TARGET;
   } else {
     double error = dTFiltered - DT_TARGET;
 
