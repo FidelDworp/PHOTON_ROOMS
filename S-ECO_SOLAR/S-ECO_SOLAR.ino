@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 1aug26: OPWARMEN vervangt de vaste OPSTART-ramp, n.a.v. de vaststelling dat na een goede dag (1u08-13u46 e.a. stabiel) de resterende slingering zich vooral 's ochtends vroeg voordeed - vermoedelijk niet enkel de sensor, maar het hele leidingcircuit dat nog koud is en pas geleidelijk mee opwarmt (grote dode tijd). Pomp start nu al bij dT>0 (DT_TRICKLE_START, nieuw) i.p.v. te wachten tot DT_START=3.0 (die drempel blijft enkel nog gelden voor de thermosifon-check). PWM klimt daarna traag en zelf-aanpassend: steil bij een snel stijgende dT, voorzichtig bij een vlakke, tot dT_gefilterd 3 minuten na elkaar stabiel is gebleven (het circuit wordt dan als opgewarmd beschouwd) - met een vaste bovengrens van 10 minuten als vangnet. De bestaande STOP-teller (floorMinutes) telt bewust niet mee tijdens deze fase, anders zou een verse trickle-start zichzelf kunnen afbreken. D-kick-fix en anti-windup blijven op dezelfde manier van toepassing als voorheen tijdens de ramp (Claude)
 - 31jul26b: PWM_MIN terug opgetrokken van 15 naar 60 (17jul26-waarde) - test van de dode-tijd-hypothese. Vier verschillende PID-instellingen (Kp/Ki/Kd: 3/0,15/0 · 4/0,15/1,2 · 6/0,5/1,2 · 8/0,6/1,2) gaven allemaal hetzelfde ~9-11-minuten-slingerpatroon, wat erop wijst dat de oorzaak niet in de PID-afstelling zit maar in een vertraging (dead time) tussen het gebeuren in de collector en het voelen ervan bij de sensor. Bij een lage doorstroming (PWM 15-30, sinds 28jul26 mogelijk) beweegt het water trager door de leiding, wat die vertraging vergroot - een klassieke oorzaak van dood-tijd-oscillatie die geen enkele PID-instelling kan wegregelen. Op 17jul26 zakte PWM nooit onder 60, vandaar de acht uur lange, stabiele werking toen. Dit kost het voordeel van de zuinige lage-PWM-werking van 28-29jul26, maar test een fundamenteel andere hypothese dan de tot nu toe geprobeerde gain-aanpassingen (Claude)
 - 31jul26: Volledig terug naar het bewezen 17jul26-werkpunt, niet enkel de gains: DT_TARGET 1,8→2,5, DT_START 2,0→3,0, Kp 6→8, Ki 0,5→0,6 (Kd blijft 1,2). Een volledige dag data (10u-16u, 23 herhalingen van dezelfde ~10-minuten-cyclus) toonde dat de PID-verzwakking van 30jul26 het probleem niet oploste - het patroon herhaalde zich ook middenin aaneengesloten REGIME-periodes, niet enkel na een herstart, wat wijst op een structureel te krap werkpunt rond een DT_TARGET/DT_HARD_STOP die te dicht bij elkaar liggen, niet enkel op de PID-sterkte. Daarnaast de D-kick-bug hier alsnog gefixt (pidPrevError bevroor tijdens de OPSTART-ramp) - eerder al gevonden en gefixt in de simulator, maar nooit teruggeport naar deze echte sketch (Claude)
 - 30jul26: PID-gains dichter bij de oorspronkelijke, bewezen 17jul26-instelling gebracht: Kp 4→6, Ki 0,15→0,5 (Kd blijft 1,2). Data toonde dat de verzwakking van 28jul26 (Kp 8→3/4, Ki 0,6→0,15) niet de eigenlijke overshoot-oorzaak wegnam (die bleek de vaste Tsun>75-override en de "hete-plug"-transiënt na herstart te zijn, ondertussen apart aangepakt), maar wél de strakke vergrendeling rond DT_TARGET kapotmaakte die op 17jul26 acht uur lang standhield (dT 2,3-2,7°C). Vooral Ki was te zwak om kleine afwijkingen actief terug te duwen, vandaar de trage "ademhaling" (dT dreef traag weg tot 15-20°C en terug) i.p.v. een echte lock. Kp niet meteen terug naar de volle 8, om niet te overdrijven samen met de ondertussen toegevoegde Kd=1,2 (die er op 17jul26 nog niet was) (Claude)
@@ -131,7 +132,10 @@ double pwmValue = 0; // 0-255 (Use double to calculate)
 // PID-regelaar voor pompsnelheid, 14jul26b - rustiger afgesteld op 28jul26
 // na een reële hardwaretest die bevestigde dat de pomp betrouwbaar draait tot PWM=15
 double DT_TARGET = 2.5;          // gewenste dT-evenwicht: Tsol moet net boven de boiler blijven
-double DT_START  = 3.0;          // drempel om de pomp te starten vanuit stilstand
+double DT_TRICKLE_START = 0.0;   // 1aug26: nieuwe, vroege starttrigger - pomp start al bij dT>0
+                                  // (i.p.v. te wachten tot de kloof groot is), traag via OPWARMEN
+double DT_START  = 3.0;          // 1aug26: stuurt de pompstart niet meer aan, enkel nog de
+                                  // thermosifon-veiligheid hieronder (ongewijzigd gebleven drempel)
 double DT_HARD_STOP = 0.0;       // "geen winst meer"-drempel, enkel relevant i.c.m. PWM_MIN hieronder
 double Kp = 8.0;
 double Ki = 0.6;
@@ -149,12 +153,26 @@ double dTFiltered = 0;
 bool dTFilterInit = false;
 const double DT_FILTER_ALPHA = 0.3;  // per minuut; lager = trager/gladder, hoger = reageert sneller
 
-// 5-fasen-ontwerp, 28jul26: OPSTART is nu een echte open-lus ramp (niet de PID zelf),
-// en STOP is een laatste redmiddel na aanhoudend falen op de PWM-bodem (fase AFBOUW)
-const double PWM_RAMP_START = 20;            // begin-PWM bij pompstart
-const double PWM_RAMP_STEP_PER_MIN = 10;     // toename per minuut tijdens de opstart-ramp
-const unsigned long PWM_RAMP_DURATION_MIN = 3;  // duur van de ramp-fase
-const double PWM_RAMP_CEILING = 60;          // veilig plafond tijdens de ramp zelf
+// OPWARMEN (1aug26, vervangt de vaste OPSTART-ramp van 28jul26): een grote dode
+// tijd bleek niet enkel bij de sensor te zitten, maar in het hele leidingcircuit -
+// tot alles op temperatuur is, blijft het slingeren ongeacht de PID-instelling.
+// PWM klimt daarom traag en zelf-aanpassend: steil bij een felle dT-stijging,
+// voorzichtig bij een vlakke. Stopt zodra dT_gefilterd een paar minuten stabiel
+// is gebleven (het circuit wordt dan als "opgewarmd" beschouwd) - met een vaste
+// bovengrens als vangnet, zodat dit nooit blijft hangen.
+const double WARMUP_PWM_START = 20;              // beginwaarde, zelfde als de oude ramp
+const double WARMUP_STEP_MIN = 4;                // PWM-toename/min bij een vlakke dT-gradiënt
+const double WARMUP_STEP_MAX = 15;               // PWM-toename/min bij een steile dT-gradiënt
+const double WARMUP_GRADIENT_REF = 2.0;          // °C/min waarbij de maximale stap al bereikt wordt
+const double WARMUP_PWM_CEILING = 90;            // veilig plafond tijdens het opwarmen
+const double WARMUP_STABLE_THRESHOLD = 0.3;      // °C/min, onder deze grens telt een minuut als 'stabiel'
+const int WARMUP_STABLE_MINUTES_NEEDED = 3;      // zoveel opeenvolgende stabiele minuten = opgewarmd
+const double WARMUP_MAX_MINUTES = 10.0;          // vangnet: hoe dan ook uiterlijk na zoveel minuten stoppen
+bool warmupActive = false;
+double warmupPwmTarget = 0;
+double prevDTForGradient = 0;
+int warmupStableMinutes = 0;
+
 double floorMinutes = 0;                     // hoeveel minuten aan een stuk op PWM_MIN zonder herstel
 const double STOP_PATIENCE_MIN = 5.0;        // pas na zoveel minuten op de bodem schakelt de relay echt uit
 
@@ -387,7 +405,10 @@ void solarPump() {
   bool shouldBeOn;
   bool atFloor = false;
   if (relayState) {
-    atFloor = (pwmValue <= PWM_MIN + 2.0);
+    // Tijdens OPWARMEN (1aug26) staat de PWM bewust laag/onder PWM_MIN - dat mag
+    // niet meetellen als "op de bodem vastzitten", anders zou de stop-teller een
+    // verse trickle-start meteen weer kunnen afbreken.
+    atFloor = (!warmupActive) && (pwmValue <= PWM_MIN + 2.0);
     bool tooLow = (dTFiltered <= DT_HARD_STOP);
     if (atFloor && tooLow) {
       floorMinutes += dtMin;
@@ -396,11 +417,15 @@ void solarPump() {
     }
     shouldBeOn = (floorMinutes < STOP_PATIENCE_MIN);
   } else {
-    shouldBeOn = (dTFiltered > DT_START);
+    // 1aug26: vroege trickle-start bij dT>0 i.p.v. te wachten tot DT_START -
+    // de OPWARMEN-fase hieronder vangt de rest rustig op
+    shouldBeOn = (dTFiltered > DT_TRICKLE_START);
     floorMinutes = 0;
   }
 
-  // Thermosifon blokkeren: voorkomt terugstroming/afkoeling bij lage Tsun (directe override)
+  // Thermosifon blokkeren: voorkomt terugstroming/afkoeling bij lage Tsun (directe
+  // override). Gebruikt nog steeds DT_START (3.0) - die drempel bleef hiervoor
+  // bestaan, enkel de pompstart zelf verhuisde naar DT_TRICKLE_START.
   if (dTFiltered > DT_START && Tsun < 22.0) {
     shouldBeOn = false;
     floorMinutes = 0;
@@ -423,6 +448,7 @@ void solarPump() {
     pidIntegral = 0;      // reset zodat er geen windup optreedt terwijl de pomp stilstaat
     pidPrevError = 0;
     floorMinutes = 0;
+    warmupActive = false; // volgende start begint weer vers
     lastPidTime = 0;      // volgende start telt weer vers vanaf dtMin=1
     analogWrite(pwmPin, 0);
     return;
@@ -436,30 +462,50 @@ void solarPump() {
     pidIntegral = 0;
     pidPrevError = dTFiltered - DT_TARGET;   // voorkomt een D-piek bij de allereerste stap
     floorMinutes = 0;
+    warmupActive = true;
+    warmupPwmTarget = WARMUP_PWM_START;
+    warmupStableMinutes = 0;
+    prevDTForGradient = dTFiltered;
   }
   lastPidTime = nowMs;
 
   digitalWrite(relayPin, LOW);
   relayState = true; relay = 1;
 
-  bool inRamp = (nowMs - pumpStartTime) < (PWM_RAMP_DURATION_MIN * 60000UL);
+  // OPWARMEN (1aug26): evalueer, ná de allereerste minuut (die heeft nog geen
+  // gradiënt om mee te vergelijken), of het circuit intussen stabiel genoeg is
+  // om als "opgewarmd" te gelden - of anders hoe hard de PWM deze minuut mag
+  // bijklimmen, evenredig met hoe steil dT_gefilterd nog stijgt.
+  if (warmupActive && !justStarted) {
+    double gradient = dTFiltered - prevDTForGradient;
+    prevDTForGradient = dTFiltered;
+    double absGradient = (gradient < 0) ? -gradient : gradient;
+
+    if (absGradient < WARMUP_STABLE_THRESHOLD) {
+      warmupStableMinutes++;
+    } else {
+      warmupStableMinutes = 0;
+    }
+
+    double minutesInWarmup = (double)(nowMs - pumpStartTime) / 60000.0;
+    if (warmupStableMinutes >= WARMUP_STABLE_MINUTES_NEEDED || minutesInWarmup >= WARMUP_MAX_MINUTES) {
+      warmupActive = false;   // circuit als opgewarmd beschouwd - PID neemt deze cyclus al over
+    } else {
+      double step = WARMUP_STEP_MIN + (WARMUP_STEP_MAX - WARMUP_STEP_MIN) *
+                    constrain(gradient / WARMUP_GRADIENT_REF, 0.0, 1.0);
+      warmupPwmTarget = constrain(warmupPwmTarget + step, WARMUP_PWM_START, WARMUP_PWM_CEILING);
+    }
+  }
 
   double pwmDoel;
 
   if (overheat) {
     pwmDoel = 255;
-  } else if (inRamp) {
-    // OPSTART: een echte open-lus ramp, losgekoppeld van de PID. Zo reageert de
-    // regelaar niet al vanaf de eerste seconde op de ruizige "hete-plug"-transiënt.
-    double minutesSinceStart = (double)(nowMs - pumpStartTime) / 60000.0;
-    pwmDoel = PWM_RAMP_START + PWM_RAMP_STEP_PER_MIN * minutesSinceStart;
-    pwmDoel = constrain(pwmDoel, PWM_RAMP_START, PWM_RAMP_CEILING);
-    // Belangrijk (31jul26): pidPrevError blijft ook tijdens de ramp elke minuut
-    // meelopen. Zonder dit zou de D-term bij de eerste REGIME-stap na de ramp
-    // een kunstmatige piek zien (vergelijking met een fout van 3 minuten
-    // geleden i.p.v. de vorige minuut), die groeit mét Kd - het omgekeerde van
-    // wat een D-term hoort te doen. Gevonden en eerst gefixt in de simulator,
-    // hier teruggeport naar de echte sketch.
+  } else if (warmupActive) {
+    pwmDoel = warmupPwmTarget;
+    // D-kick-fix (31jul26): pidPrevError blijft ook tijdens OPWARMEN meelopen,
+    // zodat REGIME nadien tegen de écht-vorige minuut vergelijkt, niet tegen
+    // een fout van vóór de hele opwarmfase.
     pidPrevError = dTFiltered - DT_TARGET;
   } else {
     double error = dTFiltered - DT_TARGET;
@@ -485,11 +531,12 @@ void solarPump() {
     pwmValue = max(pwmValue - PWM_MAX_DELTA_PER_MIN * dtMin, pwmDoel);
   }
 
-  // Status: geeft altijd exact de actieve fase weer
+  // Status: geeft altijd exact de actieve fase weer (kort en duidelijk, voor de
+  // commentaarkolom in het logblad)
   if (overheat) {
     sprintf(str, "Pump ON (OVERVERHIT) - Tsun=%.1fC >= 90C, PWM=255", Tsun);
-  } else if (inRamp) {
-    sprintf(str, "Pump ON (OPSTART) - dT gefilterd=%.1fC, ramp PWM=%d", dTFiltered, (int)pwmValue);
+  } else if (warmupActive) {
+    sprintf(str, "Pump ON (OPWARMEN) - dT=%.1fC, PWM=%d, stabiel %d/%d min", dTFiltered, (int)pwmValue, warmupStableMinutes, WARMUP_STABLE_MINUTES_NEEDED);
   } else if (atFloor) {
     sprintf(str, "Pump ON (AFBOUW) - dT gefilterd=%.1fC, PWM-bodem sinds %.1f/%.0f min", dTFiltered, floorMinutes, STOP_PATIENCE_MIN);
   } else {
