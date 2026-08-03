@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 2aug26: VROEGSTART toegevoegd als extra, preventieve starttrigger, náást de bestaande trickle-start (dT>0). Terwijl de pomp stilstaat, wordt nu ook de rauwe Tsol-gradiënt (niet dT, niet gefilterd) gevolgd: blijft die 3 minuten na elkaar boven 1,5°C/min, dan start de pomp preventief op een vaste PWM=40 gedurende 20 minuten (geen PID) - dit dient meteen als een natuurlijke dode-tijd-meting, relevant voor de aanhoudende ~9-11-minuten-slingering. Na die 20 minuten neemt de PID (REGIME) de eerstvolgende cyclus meteen over, zonder nog door de gewone OPWARMEN-fase te gaan (die heeft VROEGSTART in feite al gedaan). De klassieke trickle-start blijft ongewijzigd als vangnet bestaan voor een trage of wisselvallige ochtend waarin de gradiënt-drempel nooit gehaald wordt. D-kick-fix geldt ook tijdens VROEGSTART, en de AFBOUW-teller sluit VROEGSTART net als OPWARMEN uit (Claude)
 - 1aug26: OPWARMEN vervangt de vaste OPSTART-ramp, n.a.v. de vaststelling dat na een goede dag (1u08-13u46 e.a. stabiel) de resterende slingering zich vooral 's ochtends vroeg voordeed - vermoedelijk niet enkel de sensor, maar het hele leidingcircuit dat nog koud is en pas geleidelijk mee opwarmt (grote dode tijd). Pomp start nu al bij dT>0 (DT_TRICKLE_START, nieuw) i.p.v. te wachten tot DT_START=3.0 (die drempel blijft enkel nog gelden voor de thermosifon-check). PWM klimt daarna traag en zelf-aanpassend: steil bij een snel stijgende dT, voorzichtig bij een vlakke, tot dT_gefilterd 3 minuten na elkaar stabiel is gebleven (het circuit wordt dan als opgewarmd beschouwd) - met een vaste bovengrens van 10 minuten als vangnet. De bestaande STOP-teller (floorMinutes) telt bewust niet mee tijdens deze fase, anders zou een verse trickle-start zichzelf kunnen afbreken. D-kick-fix en anti-windup blijven op dezelfde manier van toepassing als voorheen tijdens de ramp (Claude)
 - 31jul26b: PWM_MIN terug opgetrokken van 15 naar 60 (17jul26-waarde) - test van de dode-tijd-hypothese. Vier verschillende PID-instellingen (Kp/Ki/Kd: 3/0,15/0 · 4/0,15/1,2 · 6/0,5/1,2 · 8/0,6/1,2) gaven allemaal hetzelfde ~9-11-minuten-slingerpatroon, wat erop wijst dat de oorzaak niet in de PID-afstelling zit maar in een vertraging (dead time) tussen het gebeuren in de collector en het voelen ervan bij de sensor. Bij een lage doorstroming (PWM 15-30, sinds 28jul26 mogelijk) beweegt het water trager door de leiding, wat die vertraging vergroot - een klassieke oorzaak van dood-tijd-oscillatie die geen enkele PID-instelling kan wegregelen. Op 17jul26 zakte PWM nooit onder 60, vandaar de acht uur lange, stabiele werking toen. Dit kost het voordeel van de zuinige lage-PWM-werking van 28-29jul26, maar test een fundamenteel andere hypothese dan de tot nu toe geprobeerde gain-aanpassingen (Claude)
 - 31jul26: Volledig terug naar het bewezen 17jul26-werkpunt, niet enkel de gains: DT_TARGET 1,8→2,5, DT_START 2,0→3,0, Kp 6→8, Ki 0,5→0,6 (Kd blijft 1,2). Een volledige dag data (10u-16u, 23 herhalingen van dezelfde ~10-minuten-cyclus) toonde dat de PID-verzwakking van 30jul26 het probleem niet oploste - het patroon herhaalde zich ook middenin aaneengesloten REGIME-periodes, niet enkel na een herstart, wat wijst op een structureel te krap werkpunt rond een DT_TARGET/DT_HARD_STOP die te dicht bij elkaar liggen, niet enkel op de PID-sterkte. Daarnaast de D-kick-bug hier alsnog gefixt (pidPrevError bevroor tijdens de OPSTART-ramp) - eerder al gevonden en gefixt in de simulator, maar nooit teruggeport naar deze echte sketch (Claude)
@@ -172,6 +173,22 @@ bool warmupActive = false;
 double warmupPwmTarget = 0;
 double prevDTForGradient = 0;
 int warmupStableMinutes = 0;
+
+// VROEGSTART (2aug26): extra, preventieve starttrigger náást de trickle-start.
+// Terwijl de pomp stilstaat volgen we de rauwe Tsol-gradiënt (niet dT) - blijft
+// die een paar minuten na elkaar boven de drempel, dan starten we preventief op
+// een vaste, lage PWM gedurende een vaste tijd (geen PID) - dit dient meteen als
+// een natuurlijke dode-tijd-meting. Nadien neemt de PID (REGIME) meteen over.
+const double GRADIENT_TRIGGER_THRESHOLD = 1.5;   // °C/min, rauwe Tsol-gradiënt
+const int GRADIENT_CONFIRM_MINUTES = 3;          // zoveel minuten na elkaar boven de drempel
+const double EARLY_START_PWM = 40;               // vaste PWM tijdens VROEGSTART
+const double EARLY_START_DURATION_MIN = 20.0;    // vaste duur, dient als dode-tijd-meting
+bool earlyStartActive = false;
+bool earlyStartTriggered = false;      // gezet zodra de gradiënt-drempel gehaald is, vóór de pomp start
+unsigned long earlyStartBeginTime = 0;
+double prevTsunForGradient = 0;
+bool tsunGradientTrackInit = false;
+int tsunGradientStableMinutes = 0;
 
 double floorMinutes = 0;                     // hoeveel minuten aan een stuk op PWM_MIN zonder herstel
 const double STOP_PATIENCE_MIN = 5.0;        // pas na zoveel minuten op de bodem schakelt de relay echt uit
@@ -377,6 +394,11 @@ void solarPump() {
     analogWrite(pwmPin, 0);
     floorMinutes = 0;
     pidIntegral = 0; pidPrevError = 0;
+    warmupActive = false;
+    earlyStartActive = false;
+    tsunGradientTrackInit = false;
+    tsunGradientStableMinutes = 0;
+    lastPidTime = 0;
     return;
   }
 
@@ -408,7 +430,7 @@ void solarPump() {
     // Tijdens OPWARMEN (1aug26) staat de PWM bewust laag/onder PWM_MIN - dat mag
     // niet meetellen als "op de bodem vastzitten", anders zou de stop-teller een
     // verse trickle-start meteen weer kunnen afbreken.
-    atFloor = (!warmupActive) && (pwmValue <= PWM_MIN + 2.0);
+    atFloor = (!warmupActive) && (!earlyStartActive) && (pwmValue <= PWM_MIN + 2.0);
     bool tooLow = (dTFiltered <= DT_HARD_STOP);
     if (atFloor && tooLow) {
       floorMinutes += dtMin;
@@ -421,6 +443,30 @@ void solarPump() {
     // de OPWARMEN-fase hieronder vangt de rest rustig op
     shouldBeOn = (dTFiltered > DT_TRICKLE_START);
     floorMinutes = 0;
+
+    // VROEGSTART-trigger (2aug26): terwijl de pomp stilstaat volgen we de
+    // rauwe Tsol-gradiënt (niet dT, niet gefilterd). Blijft die
+    // GRADIENT_CONFIRM_MINUTES minuten na elkaar boven de drempel, dan
+    // starten we preventief - nog vóór dT positief is. De teller blijft
+    // bewust ook doorlopen over opeenvolgende OFF-cycli heen (geen reset
+    // hieronder bij "blijft uit"), enkel een echte pompstart of een terugval
+    // onder de drempel zet hem terug op nul.
+    if (!tsunGradientTrackInit) {
+      prevTsunForGradient = Tsun;
+      tsunGradientTrackInit = true;
+    } else {
+      double tsunGradient = Tsun - prevTsunForGradient;
+      prevTsunForGradient = Tsun;
+      if (tsunGradient > GRADIENT_TRIGGER_THRESHOLD) {
+        tsunGradientStableMinutes++;
+      } else {
+        tsunGradientStableMinutes = 0;
+      }
+      if (tsunGradientStableMinutes >= GRADIENT_CONFIRM_MINUTES) {
+        earlyStartTriggered = true;
+        shouldBeOn = true;
+      }
+    }
   }
 
   // Thermosifon blokkeren: voorkomt terugstroming/afkoeling bij lage Tsun (directe
@@ -441,14 +487,19 @@ void solarPump() {
   }
 
   if (!shouldBeOn) {
-    if (relayState) sprintf(str, "Pump OFF - dT gefilterd=%.1fC, geen herstel na %.0f min op PWM-bodem", dTFiltered, STOP_PATIENCE_MIN);
+    if (relayState) {
+      sprintf(str, "Pump OFF - dT gefilterd=%.1fC, geen herstel na %.0f min op PWM-bodem", dTFiltered, STOP_PATIENCE_MIN);
+    } else {
+      sprintf(str, "Pump OFF - dT=%.1fC, wacht op start (Tsol-gradient stabiel %d/%d min)", dTFiltered, tsunGradientStableMinutes, GRADIENT_CONFIRM_MINUTES);
+    }
     digitalWrite(relayPin, HIGH);
     relayState = false; relay = 0;
     pwmValue = 0;
     pidIntegral = 0;      // reset zodat er geen windup optreedt terwijl de pomp stilstaat
     pidPrevError = 0;
     floorMinutes = 0;
-    warmupActive = false; // volgende start begint weer vers
+    warmupActive = false;    // volgende start begint weer vers
+    earlyStartActive = false;
     lastPidTime = 0;      // volgende start telt weer vers vanaf dtMin=1
     analogWrite(pwmPin, 0);
     return;
@@ -462,10 +513,23 @@ void solarPump() {
     pidIntegral = 0;
     pidPrevError = dTFiltered - DT_TARGET;   // voorkomt een D-piek bij de allereerste stap
     floorMinutes = 0;
-    warmupActive = true;
-    warmupPwmTarget = WARMUP_PWM_START;
-    warmupStableMinutes = 0;
-    prevDTForGradient = dTFiltered;
+    tsunGradientTrackInit = false;    // volgende OFF-periode start weer vers
+    tsunGradientStableMinutes = 0;
+
+    if (earlyStartTriggered) {
+      // Gestart via de Tsol-gradiënt, nog vóór dT positief werd - VROEGSTART
+      // i.p.v. de normale OPWARMEN-ramp.
+      earlyStartActive = true;
+      earlyStartBeginTime = nowMs;
+      warmupActive = false;
+    } else {
+      earlyStartActive = false;
+      warmupActive = true;
+      warmupPwmTarget = WARMUP_PWM_START;
+      warmupStableMinutes = 0;
+      prevDTForGradient = dTFiltered;
+    }
+    earlyStartTriggered = false;   // verbruikt - klaar voor de volgende cyclus
   }
   lastPidTime = nowMs;
 
@@ -476,6 +540,15 @@ void solarPump() {
   // gradiënt om mee te vergelijken), of het circuit intussen stabiel genoeg is
   // om als "opgewarmd" te gelden - of anders hoe hard de PWM deze minuut mag
   // bijklimmen, evenredig met hoe steil dT_gefilterd nog stijgt.
+  // VROEGSTART (2aug26): loopt gewoon een vaste tijd door - bewust nauwelijks
+  // bijregelen, want dit IS meteen onze natuurlijke dode-tijd-meting.
+  if (earlyStartActive && !justStarted) {
+    double minutesInEarlyStart = (double)(nowMs - earlyStartBeginTime) / 60000.0;
+    if (minutesInEarlyStart >= EARLY_START_DURATION_MIN) {
+      earlyStartActive = false;   // klaar - PID (REGIME) neemt deze cyclus al over
+    }
+  }
+
   if (warmupActive && !justStarted) {
     double gradient = dTFiltered - prevDTForGradient;
     prevDTForGradient = dTFiltered;
@@ -501,6 +574,12 @@ void solarPump() {
 
   if (overheat) {
     pwmDoel = 255;
+  } else if (earlyStartActive) {
+    pwmDoel = EARLY_START_PWM;
+    // D-kick-fix: pidPrevError blijft ook tijdens VROEGSTART meelopen, net
+    // als tijdens OPWARMEN, zodat REGIME nadien tegen de écht-vorige minuut
+    // vergelijkt.
+    pidPrevError = dTFiltered - DT_TARGET;
   } else if (warmupActive) {
     pwmDoel = warmupPwmTarget;
     // D-kick-fix (31jul26): pidPrevError blijft ook tijdens OPWARMEN meelopen,
@@ -535,6 +614,10 @@ void solarPump() {
   // commentaarkolom in het logblad)
   if (overheat) {
     sprintf(str, "Pump ON (OVERVERHIT) - Tsun=%.1fC >= 90C, PWM=255", Tsun);
+  } else if (earlyStartActive) {
+    double minutenResterend = EARLY_START_DURATION_MIN - (double)(nowMs - earlyStartBeginTime) / 60000.0;
+    if (minutenResterend < 0) minutenResterend = 0;
+    sprintf(str, "Pump ON (VROEGSTART) - Tsol-gradient>%.1fC/min, vaste PWM=%d, nog %.0f min", GRADIENT_TRIGGER_THRESHOLD, (int)EARLY_START_PWM, minutenResterend);
   } else if (warmupActive) {
     sprintf(str, "Pump ON (OPWARMEN) - dT=%.1fC, PWM=%d, stabiel %d/%d min", dTFiltered, (int)pwmValue, warmupStableMinutes, WARMUP_STABLE_MINUTES_NEEDED);
   } else if (atFloor) {
