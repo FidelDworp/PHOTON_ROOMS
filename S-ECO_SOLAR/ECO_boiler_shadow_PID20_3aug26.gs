@@ -2,7 +2,7 @@
  * ECO-boiler: Data ophalen + alert bij geen data (20 min)
  * 1 trigger: elke 10 minuten
  * Shadow mode: logica identiek aan solarPump() op de Photon (3aug26)
- *   - 3aug26: VROEGSTART verfijnd - PWM wordt nu lineair berekend uit de
+ *   - 3aug26: Update: VROEGSTART verfijnd - PWM wordt nu lineair berekend uit de
  *     trigger-gradiënt (EARLY_START_PWM_MIN..MAX tussen EARLY_START_GRADIENT_
  *     MIN..REF), i.p.v. een vaste PWM. Onder EARLY_START_GRADIENT_MIN
  *     (0,5°C/min) geen VROEGSTART meer. De duur hangt nu af van dT-
