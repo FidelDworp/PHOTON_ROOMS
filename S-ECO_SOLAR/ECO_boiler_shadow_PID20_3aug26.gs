@@ -1,8 +1,18 @@
 /*
  * ECO-boiler: Data ophalen + alert bij geen data (20 min)
  * 1 trigger: elke 10 minuten
- * Shadow mode: logica identiek aan solarPump() op de Photon (3aug26)
- *   - 3aug26: Update: VROEGSTART verfijnd - PWM wordt nu lineair berekend uit de
+ * Shadow mode: logica identiek aan solarPump() op de Photon (4aug26)
+ *   - 4aug26: VROEGSTART-PWM wordt nu LIVE bijgestuurd - elke minuut
+ *     herberekend uit de actuele Tsol-gradiënt, i.p.v. één keer vastgelegd
+ *     op het triggermoment. Reden: bij een aanhoudend snel stijgende zon
+ *     bleef de vaste PWM de collector niet bijbenen, waardoor dT ongebreideld
+ *     kon oplopen (tot >75°C geobserveerd) vóór de stabiliteits-uitgang of het
+ *     vangnet kon ingrijpen, met een fikse PWM-piek bij de REGIME-instap tot
+ *     gevolg (tot PWM=224 geobserveerd). Zelf getest in een aangepast
+ *     simulatiescript: dT-piek daalde van >75°C naar ~8°C, REGIME-instappiek
+ *     van PWM 195-224 naar PWM 110. Stabiliteits-uitgang, drempels en vangnet
+ *     blijven ongewijzigd.
+ *   - 3aug26: VROEGSTART verfijnd - PWM wordt lineair berekend uit de
  *     trigger-gradiënt (EARLY_START_PWM_MIN..MAX tussen EARLY_START_GRADIENT_
  *     MIN..REF), i.p.v. een vaste PWM. Onder EARLY_START_GRADIENT_MIN
  *     (0,5°C/min) geen VROEGSTART meer. De duur hangt nu af van dT-
@@ -171,6 +181,8 @@ function collectAndCheck() {
     var earlyStartTriggerGradient = parseFloat(props.getProperty('shadowEarlyStartTriggerGradient')) || 0;
     var earlyStartBeginMs       = parseFloat(props.getProperty('shadowEarlyStartBeginMs')) || 0;
     var earlyStartPwmTarget     = parseFloat(props.getProperty('shadowEarlyStartPwmTarget')) || 0;
+    var earlyStartPrevTsun      = parseFloat(props.getProperty('shadowEarlyStartPrevTsun')) || 0;
+    var earlyStartCurrentGradient = parseFloat(props.getProperty('shadowEarlyStartCurrentGradient')) || 0;
     var prevDTForEarlyStart     = parseFloat(props.getProperty('shadowPrevDTForEarlyStart')) || 0;
     var earlyStartStableMinutes = parseInt(props.getProperty('shadowEarlyStartStableMinutes')) || 0;
     var prevTsunForGradient     = parseFloat(props.getProperty('shadowPrevTsunForGradient')) || 0;
@@ -313,6 +325,8 @@ function collectAndCheck() {
           warmupActive = false;
           prevDTForEarlyStart = dTFiltered;
           earlyStartStableMinutes = 0;
+          earlyStartPrevTsun = Tsun;               // baseline voor de live-gradiënt (4aug26)
+          earlyStartCurrentGradient = earlyStartTriggerGradient;
           var frac = (earlyStartTriggerGradient - EARLY_START_GRADIENT_MIN) /
                      (EARLY_START_GRADIENT_REF - EARLY_START_GRADIENT_MIN);
           frac = Math.min(Math.max(frac, 0), 1);
@@ -326,9 +340,17 @@ function collectAndCheck() {
         }
         earlyStartTriggered = false;   // verbruikt - klaar voor de volgende cyclus
       } else if (earlyStartActive) {
-        // VROEGSTART (2aug26 basis, 3aug26: stabiliteits-gebaseerde duur) - de
-        // PWM ligt al vast sinds de start; enkel de duur wordt hier nog
-        // bepaald, door te wachten tot dT_gefilterd zelf stabiliseert.
+        // VROEGSTART (2aug26 basis, 3aug26: lineaire formule, 4aug26: LIVE
+        // bijsturing) - de PWM wordt hier elke minuut herberekend uit de
+        // actuele Tsol-gradiënt, i.p.v. vast te liggen sinds de start. De
+        // duur wacht nog steeds tot dT_gefilterd zelf stabiliseert.
+        earlyStartCurrentGradient = Tsun - earlyStartPrevTsun;
+        earlyStartPrevTsun = Tsun;
+        var liveFrac = (earlyStartCurrentGradient - EARLY_START_GRADIENT_MIN) /
+                       (EARLY_START_GRADIENT_REF - EARLY_START_GRADIENT_MIN);
+        liveFrac = Math.min(Math.max(liveFrac, 0), 1);
+        earlyStartPwmTarget = EARLY_START_PWM_MIN + liveFrac * (EARLY_START_PWM_MAX - EARLY_START_PWM_MIN);
+
         var esGradient = dTFiltered - prevDTForEarlyStart;
         prevDTForEarlyStart = dTFiltered;
         var esAbsGradient = Math.abs(esGradient);
@@ -399,7 +421,7 @@ function collectAndCheck() {
       if (!phase) {
         if (earlyStartActive) {
           phase = "VROEGSTART";
-          comment = "gradient=" + earlyStartTriggerGradient.toFixed(1) + "C/min -> PWM=" + Math.round(earlyStartPwmTarget) + ", stabiel " + earlyStartStableMinutes + "/" + EARLY_START_STABLE_MINUTES_NEEDED + " min (max " + EARLY_START_MAX_MINUTES.toFixed(0) + " min)";
+          comment = "live gradient=" + earlyStartCurrentGradient.toFixed(1) + "C/min -> PWM=" + Math.round(earlyStartPwmTarget) + ", stabiel " + earlyStartStableMinutes + "/" + EARLY_START_STABLE_MINUTES_NEEDED + " min (max " + EARLY_START_MAX_MINUTES.toFixed(0) + " min)";
         } else if (warmupActive) {
           phase = "OPWARMEN";
           comment = "dT=" + dTFiltered.toFixed(1) + "C, PWM=" + Math.round(pwmDoel) + ", stabiel " + warmupStableMinutes + "/" + WARMUP_STABLE_MINUTES_NEEDED + " min";
@@ -449,6 +471,8 @@ function collectAndCheck() {
     props.setProperty('shadowEarlyStartTriggerGradient', earlyStartTriggerGradient.toString());
     props.setProperty('shadowEarlyStartBeginMs', earlyStartBeginMs.toString());
     props.setProperty('shadowEarlyStartPwmTarget', earlyStartPwmTarget.toString());
+    props.setProperty('shadowEarlyStartPrevTsun', earlyStartPrevTsun.toString());
+    props.setProperty('shadowEarlyStartCurrentGradient', earlyStartCurrentGradient.toString());
     props.setProperty('shadowPrevDTForEarlyStart', prevDTForEarlyStart.toString());
     props.setProperty('shadowEarlyStartStableMinutes', earlyStartStableMinutes.toString());
     props.setProperty('shadowPrevTsunForGradient', prevTsunForGradient.toString());
