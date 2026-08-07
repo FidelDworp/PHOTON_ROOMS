@@ -142,7 +142,7 @@ double DT_TRICKLE_START = 0.0;   // 1aug26: nieuwe, vroege starttrigger - pomp s
 double DT_START  = 3.0;          // 1aug26: stuurt de pompstart niet meer aan, enkel nog de
                                   // thermosifon-veiligheid hieronder (ongewijzigd gebleven drempel)
 double DT_HARD_STOP = 0.0;       // "geen winst meer"-drempel, enkel relevant i.c.m. PWM_MIN hieronder
-double Kp = 8.0;
+double Kp = 6.0;
 double Ki = 0.6;
 double Kd = 1.2;
 double pidIntegral = 0;
