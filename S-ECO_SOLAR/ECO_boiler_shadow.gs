@@ -1,7 +1,24 @@
 /*
  * ECO-boiler: Data ophalen + alert bij geen data (20 min)
  * 1 trigger: elke 10 minuten
- * Shadow mode: logica identiek aan solarPump() op de Photon (4aug26)
+ * Shadow mode: logica identiek aan solarPump() op de Photon (6aug26 v2)
+ *   - 6aug26v2: Correctie op v1 (zie eronder), vóór v1 ooit geüpload werd.
+ *     Een stress-test toonde dat v1 - meteen op de volle evenwichts-PWM
+ *     starten met enkel een trage veiligheidsklep - dT tot -30°C kon laten
+ *     wegzakken. v2: VROEGSTART start voortaan altijd voorzichtig op de
+ *     bodem en klimt pas na een settle-venster van 2 minuten geleidelijk
+ *     naar het evenwicht; en VROEGSTART deelt voortaan het bestaande,
+ *     beproefde STOP-vangnet (floorMinutes/STOP_PATIENCE_MIN) i.p.v. daarvan
+ *     uitgesloten te zijn. Zie de Photon-sketch voor de volledige uitleg en
+ *     de eigen test-cijfers.
+ *   - 6aug26v1 (nooit geüpload): eerste versie van de dag-evenwichts-PWM.
+ *     Een traag bijgewerkte schatting van de PWM die vandaag al bewees te
+ *     werken (tijdens stabiele REGIME), gebruikt bij een nieuwe VROEGSTART
+ *     i.p.v. telkens opnieuw te reageren op een live-gradiënt die toch net
+ *     na een stilstand vervuild is. Zonder gekend evenwicht (eerste start
+ *     van de dag) blijft de live-gradiënt-bootstrap van 4aug26 gelden. Het
+ *     evenwicht wordt vergeten na een lange stilstand (vangnet voor een
+ *     nieuwe dag).
  *   - 4aug26: VROEGSTART-PWM wordt nu LIVE bijgestuurd - elke minuut
  *     herberekend uit de actuele Tsol-gradiënt, i.p.v. één keer vastgelegd
  *     op het triggermoment. Reden: bij een aanhoudend snel stijgende zon
@@ -130,6 +147,17 @@ function collectAndCheck() {
   var EARLY_START_STABLE_MINUTES_NEEDED = 3;
   var EARLY_START_MAX_MINUTES = 40.0;
   var GRADIENT_CONFIRM_MINUTES = 3;
+
+  // Dag-evenwichts-PWM (6aug26 v2) - zie de Photon-sketch voor de volledige
+  // uitleg, inclusief waarom v1 (meteen op het evenwicht starten + een trage
+  // veiligheidsklep) niet veilig genoeg bleek en gecorrigeerd is.
+  var EQUILIBRIUM_EMA_ALPHA = 0.05;
+  var EQUILIBRIUM_DT_BAND = 1.0;
+  var EQUILIBRIUM_CREEP_DT_HIGH = 3.0;
+  var EQUILIBRIUM_CREEP_PWM_STEP = 5;
+  var EQUILIBRIUM_RESET_STAGNANT_MIN = 240.0;
+  var EARLY_START_SETTLE_MINUTES = 2.0;   // hete-plug is dan bekend voorbij
+  var EARLY_START_CLIMB_STEP = 10;        // hoeveel PWM/min klimmen naar het evenwicht toe
   var STOP_PATIENCE_MIN = 5.0;      // minuten op de PWM-bodem zonder herstel vooraleer echt te stoppen
 
   var props = PropertiesService.getScriptProperties();
@@ -186,6 +214,11 @@ function collectAndCheck() {
     var prevDTForEarlyStart     = parseFloat(props.getProperty('shadowPrevDTForEarlyStart')) || 0;
     var earlyStartStableMinutes = parseInt(props.getProperty('shadowEarlyStartStableMinutes')) || 0;
     var prevTsunForGradient     = parseFloat(props.getProperty('shadowPrevTsunForGradient')) || 0;
+    // Dag-evenwichts-PWM state (6aug26)
+    var equilibriumPwm             = parseFloat(props.getProperty('shadowEquilibriumPwm')) || 0;
+    var equilibriumKnown           = props.getProperty('shadowEquilibriumKnown') === 'true';
+    var earlyStartUsingEquilibrium = props.getProperty('shadowEarlyStartUsingEquilibrium') === 'true';
+    var pumpStopMs                 = parseFloat(props.getProperty('shadowPumpStopMs')) || 0;
     var tsunGradientTrackInit   = props.getProperty('shadowTsunGradientTrackInit') === 'true';
     var tsunGradientStableMinutes = parseInt(props.getProperty('shadowTsunGradStableMin')) || 0;
 
@@ -229,7 +262,21 @@ function collectAndCheck() {
       // afbreken, want de PWM staat daar bewust laag/onder PWM_MIN.
       var wouldBeOn;
       if (prevPumpOn) {
-        atFloor = (!warmupActive) && (!earlyStartActive) && (prevPwm <= PWM_MIN + 2.0);
+        // VROEGSTART wordt hier bewust NIET meer uitgesloten (6aug26 v2) -
+        // zie de Photon-sketch voor de volledige uitleg.
+        atFloor = (!warmupActive) && (prevPwm <= PWM_MIN + 2.0);
+
+        // Dag-evenwichts-PWM bijleren (6aug26): enkel tijdens een echt
+        // stabiele REGIME - zie de Photon-sketch voor de volledige uitleg.
+        if (!warmupActive && !earlyStartActive && !atFloor && Math.abs(dTFiltered - DT_TARGET) < EQUILIBRIUM_DT_BAND) {
+          if (!equilibriumKnown) {
+            equilibriumPwm = prevPwm;
+            equilibriumKnown = true;
+          } else {
+            equilibriumPwm += EQUILIBRIUM_EMA_ALPHA * (prevPwm - equilibriumPwm);
+          }
+        }
+
         var tooLow = (dTFiltered <= DT_HARD_STOP);
         if (atFloor && tooLow) {
           floorMinutes += elapsedMin;
@@ -297,10 +344,20 @@ function collectAndCheck() {
           if (prevPumpOn) {
             phase = "STOP";
             comment = "dT gefilterd=" + dTFiltered.toFixed(1) + "C, geen herstel na " + STOP_PATIENCE_MIN.toFixed(0) + " min op PWM-bodem";
+            pumpStopMs = now.getTime();   // onthouden wanneer de pomp stopte (6aug26)
           } else {
             phase = "WACHT";
-            comment = "dT=" + dTFiltered.toFixed(1) + "C, wacht op start (Tsol-gradient stabiel " + tsunGradientStableMinutes + "/" + GRADIENT_CONFIRM_MINUTES + " min)";
+            if (equilibriumKnown) {
+              comment = "dT=" + dTFiltered.toFixed(1) + "C, wacht op start (Tsol-gradient stabiel " + tsunGradientStableMinutes + "/" + GRADIENT_CONFIRM_MINUTES + " min, dag-evenwicht=" + Math.round(equilibriumPwm) + ")";
+            } else {
+              comment = "dT=" + dTFiltered.toFixed(1) + "C, wacht op start (Tsol-gradient stabiel " + tsunGradientStableMinutes + "/" + GRADIENT_CONFIRM_MINUTES + " min, nog geen dag-evenwicht)";
+            }
           }
+        }
+        // Dag-evenwicht vergeten na een lange stilstand - vangnet voor een
+        // nieuwe dag (6aug26)
+        if (equilibriumKnown && pumpStopMs > 0 && (now.getTime() - pumpStopMs) / 60000 > EQUILIBRIUM_RESET_STAGNANT_MIN) {
+          equilibriumKnown = false;
         }
       }
     }
@@ -327,10 +384,20 @@ function collectAndCheck() {
           earlyStartStableMinutes = 0;
           earlyStartPrevTsun = Tsun;               // baseline voor de live-gradiënt (4aug26)
           earlyStartCurrentGradient = earlyStartTriggerGradient;
-          var frac = (earlyStartTriggerGradient - EARLY_START_GRADIENT_MIN) /
-                     (EARLY_START_GRADIENT_REF - EARLY_START_GRADIENT_MIN);
-          frac = Math.min(Math.max(frac, 0), 1);
-          earlyStartPwmTarget = EARLY_START_PWM_MIN + frac * (EARLY_START_PWM_MAX - EARLY_START_PWM_MIN);
+
+          if (equilibriumKnown) {
+            // Dag-evenwicht gekend (6aug26 v2): start voorzichtig op de
+            // bodem, klim er pas ná het settle-venster geleidelijk naartoe.
+            earlyStartUsingEquilibrium = true;
+            earlyStartPwmTarget = EARLY_START_PWM_MIN;
+          } else {
+            // Eerste start van de dag - terug op de live-gradiënt-bootstrap.
+            earlyStartUsingEquilibrium = false;
+            var frac = (earlyStartTriggerGradient - EARLY_START_GRADIENT_MIN) /
+                       (EARLY_START_GRADIENT_REF - EARLY_START_GRADIENT_MIN);
+            frac = Math.min(Math.max(frac, 0), 1);
+            earlyStartPwmTarget = EARLY_START_PWM_MIN + frac * (EARLY_START_PWM_MAX - EARLY_START_PWM_MIN);
+          }
         } else {
           earlyStartActive = false;
           warmupActive = true;
@@ -341,15 +408,32 @@ function collectAndCheck() {
         earlyStartTriggered = false;   // verbruikt - klaar voor de volgende cyclus
       } else if (earlyStartActive) {
         // VROEGSTART (2aug26 basis, 3aug26: lineaire formule, 4aug26: LIVE
-        // bijsturing) - de PWM wordt hier elke minuut herberekend uit de
-        // actuele Tsol-gradiënt, i.p.v. vast te liggen sinds de start. De
-        // duur wacht nog steeds tot dT_gefilterd zelf stabiliseert.
+        // bijsturing, 6aug26 v2: settle-venster + dag-evenwicht met
+        // geleidelijke klim). De duur wacht in beide gevallen tot
+        // dT_gefilterd zelf stabiliseert.
         earlyStartCurrentGradient = Tsun - earlyStartPrevTsun;
         earlyStartPrevTsun = Tsun;
-        var liveFrac = (earlyStartCurrentGradient - EARLY_START_GRADIENT_MIN) /
-                       (EARLY_START_GRADIENT_REF - EARLY_START_GRADIENT_MIN);
-        liveFrac = Math.min(Math.max(liveFrac, 0), 1);
-        earlyStartPwmTarget = EARLY_START_PWM_MIN + liveFrac * (EARLY_START_PWM_MAX - EARLY_START_PWM_MIN);
+        var minutesSinceStart = (now.getTime() - earlyStartBeginMs) / 60000;
+
+        // Settle-venster (6aug26 v2): zie de Photon-sketch voor de volledige
+        // uitleg - de eerste EARLY_START_SETTLE_MINUTES wordt nog niets
+        // herberekend, earlyStartPwmTarget blijft op de startwaarde staan.
+        if (minutesSinceStart > EARLY_START_SETTLE_MINUTES) {
+          if (dTFiltered <= DT_HARD_STOP) {
+            earlyStartPwmTarget = EARLY_START_PWM_MIN;
+          } else if (earlyStartUsingEquilibrium) {
+            if (earlyStartPwmTarget < equilibriumPwm) {
+              earlyStartPwmTarget = Math.min(equilibriumPwm, earlyStartPwmTarget + EARLY_START_CLIMB_STEP);
+            } else if (dTFiltered > DT_TARGET + EQUILIBRIUM_CREEP_DT_HIGH) {
+              earlyStartPwmTarget = Math.min(EARLY_START_PWM_MAX, earlyStartPwmTarget + EQUILIBRIUM_CREEP_PWM_STEP);
+            }
+          } else {
+            var liveFrac = (earlyStartCurrentGradient - EARLY_START_GRADIENT_MIN) /
+                           (EARLY_START_GRADIENT_REF - EARLY_START_GRADIENT_MIN);
+            liveFrac = Math.min(Math.max(liveFrac, 0), 1);
+            earlyStartPwmTarget = EARLY_START_PWM_MIN + liveFrac * (EARLY_START_PWM_MAX - EARLY_START_PWM_MIN);
+          }
+        }
 
         var esGradient = dTFiltered - prevDTForEarlyStart;
         prevDTForEarlyStart = dTFiltered;
@@ -421,7 +505,14 @@ function collectAndCheck() {
       if (!phase) {
         if (earlyStartActive) {
           phase = "VROEGSTART";
-          comment = "live gradient=" + earlyStartCurrentGradient.toFixed(1) + "C/min -> PWM=" + Math.round(earlyStartPwmTarget) + ", stabiel " + earlyStartStableMinutes + "/" + EARLY_START_STABLE_MINUTES_NEEDED + " min (max " + EARLY_START_MAX_MINUTES.toFixed(0) + " min)";
+          var minutesSinceStartForLog = (now.getTime() - earlyStartBeginMs) / 60000;
+          if (minutesSinceStartForLog <= EARLY_START_SETTLE_MINUTES) {
+            comment = "settle-venster (" + minutesSinceStartForLog.toFixed(1) + "/" + EARLY_START_SETTLE_MINUTES.toFixed(0) + " min), PWM=" + Math.round(earlyStartPwmTarget) + (earlyStartUsingEquilibrium ? (", evenwicht=" + Math.round(equilibriumPwm)) : " (bootstrap)");
+          } else if (earlyStartUsingEquilibrium) {
+            comment = "klimt naar dag-evenwicht " + Math.round(equilibriumPwm) + ", nu PWM=" + Math.round(earlyStartPwmTarget) + " (dT=" + dTFiltered.toFixed(1) + "C), stabiel " + earlyStartStableMinutes + "/" + EARLY_START_STABLE_MINUTES_NEEDED + " min (max " + EARLY_START_MAX_MINUTES.toFixed(0) + " min)";
+          } else {
+            comment = "live gradient=" + earlyStartCurrentGradient.toFixed(1) + "C/min -> PWM=" + Math.round(earlyStartPwmTarget) + ", stabiel " + earlyStartStableMinutes + "/" + EARLY_START_STABLE_MINUTES_NEEDED + " min (max " + EARLY_START_MAX_MINUTES.toFixed(0) + " min)";
+          }
         } else if (warmupActive) {
           phase = "OPWARMEN";
           comment = "dT=" + dTFiltered.toFixed(1) + "C, PWM=" + Math.round(pwmDoel) + ", stabiel " + warmupStableMinutes + "/" + WARMUP_STABLE_MINUTES_NEEDED + " min";
@@ -476,6 +567,10 @@ function collectAndCheck() {
     props.setProperty('shadowPrevDTForEarlyStart', prevDTForEarlyStart.toString());
     props.setProperty('shadowEarlyStartStableMinutes', earlyStartStableMinutes.toString());
     props.setProperty('shadowPrevTsunForGradient', prevTsunForGradient.toString());
+    props.setProperty('shadowEquilibriumPwm', equilibriumPwm.toString());
+    props.setProperty('shadowEquilibriumKnown', equilibriumKnown.toString());
+    props.setProperty('shadowEarlyStartUsingEquilibrium', earlyStartUsingEquilibrium.toString());
+    props.setProperty('shadowPumpStopMs', pumpStopMs.toString());
     props.setProperty('shadowTsunGradientTrackInit', tsunGradientTrackInit.toString());
     props.setProperty('shadowTsunGradStableMin', tsunGradientStableMinutes.toString());
 
