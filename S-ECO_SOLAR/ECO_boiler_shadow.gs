@@ -121,7 +121,7 @@ function collectAndCheck() {
   var DT_TRICKLE_START = 0.0;  // 1aug26: nieuwe, vroege starttrigger (i.p.v. DT_START)
   var DT_START = 3.0;          // 1aug26: enkel nog voor de thermosifon-check
   var DT_HARD_STOP = 0.0;
-  var Kp = 8.0;
+  var Kp = 6.0;
   var Ki = 0.6;
   var Kd = 1.2;
   var PID_I_MAX = 50.0;
