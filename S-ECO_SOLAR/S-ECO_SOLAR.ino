@@ -1,6 +1,7 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 8aug26 (PID25): Sensor-boot-guard toegevoegd. Data van 8aug26 toonde dat de pomp na élke reflash meteen (binnen de eerste minuut, via OPWARMEN) kon starten, terwijl dT in werkelijkheid diep negatief was (-4 tot -20°C) en bleef, want OPWARMEN reageert enkel op de gradiënt van dT, niet op de absolute waarde, en merkte dus niets vreemds. Oorzaak: Tsun en Tboil starten allebei op 0 (placeholder) tot de eerste geldige sensormeting. Tboil komt van de DS18B20 T-BUS, die - zoals de sketch zelf al erkende bij prevEQtotInit - CRC-fouten kan geven vlak na het opstarten; Tsun komt van een aparte, snellere SPI-sensor (MAX31865) die meestal wél meteen lukt. Als dat samenvalt (Tsun al geldig, Tboil nog op 0), berekent dT = Tsun - Tboil een grote, vals-positieve waarde (bv. 40-0=+40°C) - genoeg om de pomp meteen te laten starten. Fix: een nieuwe sensorsValidInit-vlag (zelfde patroon als het al-bestaande prevEQtotInit hierboven) houdt de pomp geforceerd uit tot Tboil>5°C (fysisch plausibel voor een boiler) én Tsun niet meer op 0 staat - dus tot beide metingen aantoonbaar geldig zijn, ongeacht wat de (voorlopig onbetrouwbare) dT ondertussen lijkt te zeggen (Claude)
 - 8aug26 (PID24): Correctie op een onbedoeld neveneffect van 6aug26v2. Een echt koude ochtend (dT start op -47°C) toonde dat VROEGSTART's bootstrap-modus (eerste start van de dag) om de 5 minuten voortijdig gestopt en herstart werd - hortend, met meerdere volledige STOP-cycli vóór REGIME ooit bereikt werd. Oorzaak: v2 liet ELKE VROEGSTART (dus ook bootstrap) het STOP-vangnet delen én liet "dT<=0" de PWM sowieso naar de bodem dwingen. Dat was terecht bedoeld voor de dag-evenwicht-modus (waar het risico is: te sterk vertrekken op een mogelijk verouderde waarde), maar bootstrap heeft dat risico niet - haar PWM is per definitie al voorzichtig, evenredig met de actuele, live gemeten gradiënt. Bij een koude start blijft dT sowieso lang negatief terwijl de gradiënt zelf gezond is - dat hoort zo, het is geen storing. Fix: de dT<=0-regel en het gedeelde STOP-vangnet gelden voortaan enkel nog voor de evenwicht-modus; bootstrap is terug uitgesloten, zoals in PID19-21, en vertrouwt op haar eigen bestaande vangnetten (3 min stabiliteit, 40 min max). Zelf getest: een gereproduceerde koude-ochtendstart (dT begint op -40°C) gaf met de oude logica 2 volledige STOPs in de eerste 90 minuten; met de fix nul, en een vlot doorklimmende PWM (Claude)
 - 8aug26 (PID23): Kp verlaagd van 8.0 naar 6.0 - geïsoleerde wijziging, verder niets aangepast. Aanleiding: data van 7aug26 toonde herhaalde, kortstondige REGIME-overshoots bij een voorbijtrekkende zonneflits (fout tot >4°C, PWM tot 122) - telkens veroorzaakt door de P-term (Kp x fout), niet door I of D (eigen test: bij een stevige flits leverde P alleen al ~35 bij, tegenover ~7 voor I en ~3 voor D samen - D draagt nauwelijks bij omdat dT_gefilterd zelf al een EMA is). Eigen simulatie (10 flits-varianten, 8 volledige wolkendagen): Kp=6.0 verlaagt de piek-PWM consistent met 5-15%, zonder de REGIME-steady-state-kwaliteit merkbaar te raken (% tijd binnen 1,5°C en binnen 0,5°C van doel bleef nagenoeg identiek over 8 dagen). Eerlijke kanttekening: dit is een echte fysische afweging, geen bug - bij een stevige flits piekt dT zelf iets hoger (gemiddeld +0,25°C in eigen test) omdat de pomp bewust iets minder fel reageert. Bewust gekozen boven twee alternatieven die wél negatieve neveneffecten bleken te hebben: een feedforward-basis (dag-evenwicht i.p.v. PWM_MIN als vertrekpunt) verlaagde dT-pieken wel, maar verhóógde de PWM-pieken juist (want de basis komt bovenop dezelfde reactieve termen); een strengere REGIME-ramplimiet zou de pomp trager laten volgen op een echte zonsterkte, waardoor dT juist langer en hoger zou oplopen (Claude)
 - 6aug26v2: Belangrijke correctie op de dag-evenwichts-PWM van hieronder (6aug26v1), vóór die ooit geüpload werd. Een eigen stress-test (boiler nog heet van een sterke periode, zon bij een nieuwe herstart net zwak) toonde dat v1 - die meteen op de volle evenwichts-PWM startte, met enkel een trage "-15 PWM/min als dT te negatief wordt"-klep - dT tot -30°C kon laten wegzakken vóór de klep bijbeende. v2 lost dit op met twee wijzigingen: (1) VROEGSTART start voortaan altijd voorzichtig op de bodem (EARLY_START_PWM_MIN), ongeacht de modus, en klimt pas ná een settle-venster van 2 minuten (de hete-plug is dan bekend voorbij) geleidelijk naar het evenwicht toe - nooit in één sprong; (2) VROEGSTART deelt voortaan het bestaande, beproefde STOP-vangnet (floorMinutes/STOP_PATIENCE_MIN) i.p.v. daarvan uitgesloten te zijn, dus een herstart die niet aanslaat (dT blijft ≤0) stopt binnen dezelfde 5 minuten die de rest van het systeem al als aanvaardbaar risico hanteert, i.p.v. tot 40 minuten te kunnen doorlopen zonder enig vangnet. Zelf opnieuw getest onder een realistischer fysica-model (dat ook echt energieverlies simuleert als de pomp draait terwijl Tsol kouder is dan BotH, niet enkel het optimistische "geen extractie"-model van eerder): t.o.v. de huidige, al-lopende live-gradiënt-aanpak (PID21) daalden de grote PWM-sprongen tijdens VROEGSTART met 60-75% (10-14 naar 2-5 per dag, over 5 synthetische wolkendagen), terwijl een misgelopen herstart nu voor het eerst een hard begrensd vangnet heeft dat PID21 nooit had (Claude)
@@ -132,6 +133,17 @@ int pwmPin = A7; // On PhotoniX shield, connect these pins (A7, 5V, Gnd) and inc
 
 double Tboil = 0; // Boiler temperature where SOLAR liquid enters: EBotH
 double Tsun = 0;
+// Boot-guard (8aug26, PID25): pas TRUE zodra Tsun EN Tboil allebei een
+// plausibele eerste meting gaven - beschermt tegen het scenario waarbij Tsun
+// (snelle SPI-sensor) al wél een geldige waarde heeft, maar Tboil (DS18B20
+// T-BUS, kan CRC-fouten geven vlak na het opstarten - zie prevEQtotInit
+// hierboven voor hetzelfde, al langer gekende probleem) nog op zijn 0-
+// placeholder staat. Zonder deze guard berekent dT = Tsun - Tboil dan een
+// vals-positieve waarde (bv. 40-0=+40°C), wat de pomp meteen na elke reflash
+// ten onrechte laat starten - geobserveerd op 8aug26 (dT bleef daarna
+// -4 tot -20°C terwijl OPWARMEN gewoon doorklom, want OPWARMEN reageert enkel
+// op de gradiënt van dT, niet op de absolute waarde).
+bool sensorsValidInit = false;
 double dT = Tsun - Tboil;
 double Hysteresis = 1;
 double pwmValue = 0; // 0-255 (Use double to calculate)
@@ -372,6 +384,14 @@ void loop()
     Tboil = EBotH;
     dT = Tsun - Tboil;
 
+    // Boot-guard (8aug26, PID25): pas zodra Tboil plausibel is (een echte
+    // boiler staat nooit onder de 5°C) én Tsun niet meer op zijn 0-placeholder
+    // staat, vertrouwen we de metingen voor het eerst. Zie de declaratie
+    // hierboven voor de volledige uitleg.
+    if (!sensorsValidInit && Tboil > 5.0 && Tsun != 0.0) {
+      sensorsValidInit = true;
+    }
+
 
     // --- LIVE WIFI & MEM ---
     wifiRSSI = WiFi.RSSI();  // ← int
@@ -443,6 +463,29 @@ void solarPump() {
     digitalWrite(relayPin, HIGH);
     relayState = false; relay = 0; pwmValue = 0;
     sprintf(str, "Pump OFF - Nachtblokkering");
+    analogWrite(pwmPin, 0);
+    floorMinutes = 0;
+    pidIntegral = 0; pidPrevError = 0;
+    warmupActive = false;
+    earlyStartActive = false;
+    earlyStartStableMinutes = 0;
+    tsunGradientTrackInit = false;
+    tsunGradientStableMinutes = 0;
+    lastPidTime = 0;
+    return;
+  }
+
+  // Sensor-boot-guard (8aug26, PID25): zolang Tsun/Tboil nog geen plausibele
+  // eerste meting gaven (zie sensorsValidInit hierboven), forceren we de pomp
+  // uit - ongeacht wat dT op dit moment lijkt te zeggen. Voorkomt een valse
+  // start vlak na elke reflash, wanneer Tboil (DS18B20 T-BUS) soms nog op
+  // zijn 0-placeholder staat terwijl Tsun (MAX31865) al wél een echte waarde
+  // geeft - dat gaf tot nu toe een vals-positieve dT die de pomp meteen liet
+  // starten, terwijl de échte dT in werkelijkheid diep negatief bleef.
+  if (!sensorsValidInit) {
+    digitalWrite(relayPin, HIGH);
+    relayState = false; relay = 0; pwmValue = 0;
+    sprintf(str, "Pump OFF - wacht op een eerste geldige sensormeting (Tsun/Tboil)");
     analogWrite(pwmPin, 0);
     floorMinutes = 0;
     pidIntegral = 0; pidPrevError = 0;
