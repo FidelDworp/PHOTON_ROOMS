@@ -1,6 +1,8 @@
 /* S-ECO_SOLAR.ino = Energy_Monitor + SOLAR Pump controller for the "ECO-Boiler" Photon in the boiler room.
 
 Versions:
+- 8aug26 (PID24): Correctie op een onbedoeld neveneffect van 6aug26v2. Een echt koude ochtend (dT start op -47°C) toonde dat VROEGSTART's bootstrap-modus (eerste start van de dag) om de 5 minuten voortijdig gestopt en herstart werd - hortend, met meerdere volledige STOP-cycli vóór REGIME ooit bereikt werd. Oorzaak: v2 liet ELKE VROEGSTART (dus ook bootstrap) het STOP-vangnet delen én liet "dT<=0" de PWM sowieso naar de bodem dwingen. Dat was terecht bedoeld voor de dag-evenwicht-modus (waar het risico is: te sterk vertrekken op een mogelijk verouderde waarde), maar bootstrap heeft dat risico niet - haar PWM is per definitie al voorzichtig, evenredig met de actuele, live gemeten gradiënt. Bij een koude start blijft dT sowieso lang negatief terwijl de gradiënt zelf gezond is - dat hoort zo, het is geen storing. Fix: de dT<=0-regel en het gedeelde STOP-vangnet gelden voortaan enkel nog voor de evenwicht-modus; bootstrap is terug uitgesloten, zoals in PID19-21, en vertrouwt op haar eigen bestaande vangnetten (3 min stabiliteit, 40 min max). Zelf getest: een gereproduceerde koude-ochtendstart (dT begint op -40°C) gaf met de oude logica 2 volledige STOPs in de eerste 90 minuten; met de fix nul, en een vlot doorklimmende PWM (Claude)
+- 8aug26 (PID23): Kp verlaagd van 8.0 naar 6.0 - geïsoleerde wijziging, verder niets aangepast. Aanleiding: data van 7aug26 toonde herhaalde, kortstondige REGIME-overshoots bij een voorbijtrekkende zonneflits (fout tot >4°C, PWM tot 122) - telkens veroorzaakt door de P-term (Kp x fout), niet door I of D (eigen test: bij een stevige flits leverde P alleen al ~35 bij, tegenover ~7 voor I en ~3 voor D samen - D draagt nauwelijks bij omdat dT_gefilterd zelf al een EMA is). Eigen simulatie (10 flits-varianten, 8 volledige wolkendagen): Kp=6.0 verlaagt de piek-PWM consistent met 5-15%, zonder de REGIME-steady-state-kwaliteit merkbaar te raken (% tijd binnen 1,5°C en binnen 0,5°C van doel bleef nagenoeg identiek over 8 dagen). Eerlijke kanttekening: dit is een echte fysische afweging, geen bug - bij een stevige flits piekt dT zelf iets hoger (gemiddeld +0,25°C in eigen test) omdat de pomp bewust iets minder fel reageert. Bewust gekozen boven twee alternatieven die wél negatieve neveneffecten bleken te hebben: een feedforward-basis (dag-evenwicht i.p.v. PWM_MIN als vertrekpunt) verlaagde dT-pieken wel, maar verhóógde de PWM-pieken juist (want de basis komt bovenop dezelfde reactieve termen); een strengere REGIME-ramplimiet zou de pomp trager laten volgen op een echte zonsterkte, waardoor dT juist langer en hoger zou oplopen (Claude)
 - 6aug26v2: Belangrijke correctie op de dag-evenwichts-PWM van hieronder (6aug26v1), vóór die ooit geüpload werd. Een eigen stress-test (boiler nog heet van een sterke periode, zon bij een nieuwe herstart net zwak) toonde dat v1 - die meteen op de volle evenwichts-PWM startte, met enkel een trage "-15 PWM/min als dT te negatief wordt"-klep - dT tot -30°C kon laten wegzakken vóór de klep bijbeende. v2 lost dit op met twee wijzigingen: (1) VROEGSTART start voortaan altijd voorzichtig op de bodem (EARLY_START_PWM_MIN), ongeacht de modus, en klimt pas ná een settle-venster van 2 minuten (de hete-plug is dan bekend voorbij) geleidelijk naar het evenwicht toe - nooit in één sprong; (2) VROEGSTART deelt voortaan het bestaande, beproefde STOP-vangnet (floorMinutes/STOP_PATIENCE_MIN) i.p.v. daarvan uitgesloten te zijn, dus een herstart die niet aanslaat (dT blijft ≤0) stopt binnen dezelfde 5 minuten die de rest van het systeem al als aanvaardbaar risico hanteert, i.p.v. tot 40 minuten te kunnen doorlopen zonder enig vangnet. Zelf opnieuw getest onder een realistischer fysica-model (dat ook echt energieverlies simuleert als de pomp draait terwijl Tsol kouder is dan BotH, niet enkel het optimistische "geen extractie"-model van eerder): t.o.v. de huidige, al-lopende live-gradiënt-aanpak (PID21) daalden de grote PWM-sprongen tijdens VROEGSTART met 60-75% (10-14 naar 2-5 per dag, over 5 synthetische wolkendagen), terwijl een misgelopen herstart nu voor het eerst een hard begrensd vangnet heeft dat PID21 nooit had (Claude)
 - 6aug26v1 (nooit geüpload): eerste versie van de dag-evenwichts-PWM. Kernidee (van Opie): in plaats van bij élke VROEGSTART-herstart blind te reageren op een live-gradiënt die toch net na een stilstand vervuild is door het hete-plug-effect, onthoudt de sketch een traag bijgewerkte "evenwichts-PWM" - de PWM die de dag al bewees te werken tijdens stabiele REGIME-periodes - en start daar bij een nieuwe herstart direct op. Bleek bij eigen stress-test niet veilig genoeg (zie 6aug26v2 hierboven) (Claude)
 - 4aug26: VROEGSTART-PWM wordt nu LIVE bijgestuurd - elke minuut herberekend uit de actuele Tsol-gradiënt (dezelfde lineaire formule als voorheen), i.p.v. één keer vastgelegd op het triggermoment. Reden: bij een aanhoudend snel stijgende zon bleef de vaste PWM van 3aug26 de collector niet bijbenen - dT liep dan ongebreideld op (tot >75°C geobserveerd op de installatie) vóór de stabiliteits-uitgang of het 40-minuten-vangnet ooit kon ingrijpen, met een fikse PWM-piek bij de REGIME-instap tot gevolg (tot PWM=224 geobserveerd). Met live bijsturing schaalt de PWM voortaan mee zodra de gradiënt hoog blijft, wat dT vanzelf begrensd houdt. Zelf getest in een aangepast simulatiescript (aanhoudend stijgend zon-scenario): dT-piek daalde van >75°C naar ~8°C, REGIME-instappiek van PWM 195-224 naar PWM 110. Stabiliteits-uitgang, drempels en vangnet blijven ongewijzigd - enkel de PWM-berekening zelf is aangepast (Claude)
@@ -481,13 +483,23 @@ void solarPump() {
     // Tijdens OPWARMEN (1aug26) staat de PWM bewust laag/onder PWM_MIN - dat mag
     // niet meetellen als "op de bodem vastzitten", anders zou de stop-teller een
     // verse trickle-start meteen weer kunnen afbreken (OPWARMEN begrenst zichzelf
-    // al via WARMUP_MAX_MINUTES). VROEGSTART wordt hier bewust NIET meer
-    // uitgesloten (6aug26 v2): een gezonde VROEGSTART duwt dT vanzelf snel boven
-    // 0°C, dus die haalt de 5-minuten-patience nooit; een VROEGSTART die dat niet
-    // lukt (bv. een te hoog dag-evenwicht tegen een intussen te zwakke zon) wordt
-    // zo, net als een slechte REGIME-periode, binnen dezelfde beproefde 5 minuten
-    // gestopt i.p.v. tot 40 minuten te kunnen doorlopen.
-    atFloor = (!warmupActive) && (pwmValue <= PWM_MIN + 2.0);
+    // al via WARMUP_MAX_MINUTES).
+    //
+    // VROEGSTART: sinds 6aug26 v2 deelde ELKE VROEGSTART het STOP-vangnet, om de
+    // dag-evenwicht-modus te beschermen tegen een te hoog vertrekpunt. Bleek op
+    // 8aug26 een onbedoeld neveneffect te hebben op de BOOTSTRAP-modus (eerste
+    // start van de dag): bij een koude ochtend (dT start diep negatief, bv.
+    // -47°C vandaag) duurt het normaal een hele tijd vóór dT positief wordt -
+    // dat is geen storing, dat hoort zo bij VROEGSTART. Maar doordat bootstrap
+    // ook aan de STOP-teller hing, werd de pomp om de 5 minuten voortijdig
+    // gestopt en herstart, wat een hortende, herhaaldelijk onderbroken opstart
+    // gaf. Daarom (8aug26, PID24): enkel de EVENWICHT-modus van VROEGSTART blijft
+    // het STOP-vangnet delen (daar was het risico - te sterk vertrekken op een
+    // mogelijk verouderde waarde - ook effectief het probleem); de bootstrap-
+    // modus is terug uitgesloten, zoals in PID19-21, en vertrouwt op haar eigen,
+    // altijd al bestaande vangnetten (3 min stabiliteit, of 40 min max).
+    bool bootstrapVroegstart = earlyStartActive && !earlyStartUsingEquilibrium;
+    atFloor = (!warmupActive) && (!bootstrapVroegstart) && (pwmValue <= PWM_MIN + 2.0);
 
     // Dag-evenwichts-PWM bijleren (6aug26): enkel tijdens een echt stabiele
     // REGIME - niet tijdens OPWARMEN, VROEGSTART of AFBOUW (die zijn per
@@ -665,24 +677,29 @@ void solarPump() {
     // blijft op wat bij de start werd ingesteld (de bodem bij een gekend
     // evenwicht, of de trigger-gebaseerde schatting bij de live-bootstrap).
     if (minutesSinceStart > EARLY_START_SETTLE_MINUTES) {
-      if (dTFiltered <= DT_HARD_STOP) {
-        // Het werkt niet - ongeacht de modus terug naar de bodem. Dit voedt
-        // meteen ook de floorMinutes/STOP-teller hierboven, dus een herstart
-        // die zo blijft hangen, stopt vanzelf binnen STOP_PATIENCE_MIN.
-        earlyStartPwmTarget = EARLY_START_PWM_MIN;
-      } else if (earlyStartUsingEquilibrium) {
-        // Het werkt wél: klim geleidelijk naar het gekende dag-evenwicht toe
-        // (nooit in één keer) - en licht daarboven uit als dT ver boven het
-        // doel blijft hangen (de zon is dan sterker dan het evenwicht nog
-        // veronderstelt).
-        if (earlyStartPwmTarget < equilibriumPwm) {
+      if (earlyStartUsingEquilibrium) {
+        // Dag-evenwicht-modus (8aug26 PID24: dT<=0-veiligheid enkel hier, zie
+        // hierboven bij atFloor voor de volledige uitleg waarom dit niet meer
+        // voor bootstrap geldt). Werkt het niet (dT<=0), dan terug naar de
+        // bodem - dit voedt meteen ook de floorMinutes/STOP-teller hierboven,
+        // dus een herstart die zo blijft hangen, stopt vanzelf binnen
+        // STOP_PATIENCE_MIN. Werkt het wél: klim geleidelijk naar het gekende
+        // dag-evenwicht toe (nooit in één keer) - en licht daarboven uit als
+        // dT ver boven het doel blijft hangen (de zon is dan sterker dan het
+        // evenwicht nog veronderstelt).
+        if (dTFiltered <= DT_HARD_STOP) {
+          earlyStartPwmTarget = EARLY_START_PWM_MIN;
+        } else if (earlyStartPwmTarget < equilibriumPwm) {
           earlyStartPwmTarget = fmin(equilibriumPwm, earlyStartPwmTarget + EARLY_START_CLIMB_STEP);
         } else if (dTFiltered > DT_TARGET + EQUILIBRIUM_CREEP_DT_HIGH) {
           earlyStartPwmTarget = fmin(EARLY_START_PWM_MAX, earlyStartPwmTarget + EQUILIBRIUM_CREEP_PWM_STEP);
         }
       } else {
         // Nog geen dag-evenwicht gekend (eerste start van de dag) - terug op
-        // de live-gradiënt-bootstrap van 4aug26.
+        // de live-gradiënt-bootstrap van 4aug26, ONVOORWAARDELIJK (8aug26
+        // PID24: geen dT<=0-afkap meer hier - bij een koude ochtendstart blijft
+        // dT normaal lang negatief terwijl de gradiënt zelf prima gezond is;
+        // dat is geen storing, dat hoort zo bij VROEGSTART).
         double liveFrac = (earlyStartCurrentGradient - EARLY_START_GRADIENT_MIN) /
                            (EARLY_START_GRADIENT_REF - EARLY_START_GRADIENT_MIN);
         liveFrac = constrain(liveFrac, 0.0, 1.0);
