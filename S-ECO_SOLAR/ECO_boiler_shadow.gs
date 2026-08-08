@@ -1,7 +1,13 @@
 /*
  * ECO-boiler: Data ophalen + alert bij geen data (20 min)
  * 1 trigger: elke 10 minuten
- * Shadow mode: logica identiek aan solarPump() op de Photon (6aug26 v2)
+ * Shadow mode: logica identiek aan solarPump() op de Photon (8aug26, PID24)
+ *   - 8aug26 (PID24): correctie op een onbedoeld neveneffect van 6aug26v2 -
+ *     enkel de evenwicht-modus van VROEGSTART deelt nog het STOP-vangnet en
+ *     de dT<=0-veiligheid; bootstrap is terug uitgesloten. Zie de
+ *     Photon-sketch voor de volledige uitleg en de eigen test-cijfers.
+ *   - 8aug26 (PID23): Kp verlaagd van 8.0 naar 6.0 - geïsoleerde wijziging.
+ *     Zie de Photon-sketch voor de volledige uitleg en de eigen test-cijfers.
  *   - 6aug26v2: Correctie op v1 (zie eronder), vóór v1 ooit geüpload werd.
  *     Een stress-test toonde dat v1 - meteen op de volle evenwichts-PWM
  *     starten met enkel een trage veiligheidsklep - dT tot -30°C kon laten
@@ -262,9 +268,10 @@ function collectAndCheck() {
       // afbreken, want de PWM staat daar bewust laag/onder PWM_MIN.
       var wouldBeOn;
       if (prevPumpOn) {
-        // VROEGSTART wordt hier bewust NIET meer uitgesloten (6aug26 v2) -
-        // zie de Photon-sketch voor de volledige uitleg.
-        atFloor = (!warmupActive) && (prevPwm <= PWM_MIN + 2.0);
+        // Enkel de evenwicht-modus van VROEGSTART deelt het STOP-vangnet
+        // (8aug26 PID24-correctie) - zie de Photon-sketch voor de uitleg.
+        var bootstrapVroegstart = earlyStartActive && !earlyStartUsingEquilibrium;
+        atFloor = (!warmupActive) && (!bootstrapVroegstart) && (prevPwm <= PWM_MIN + 2.0);
 
         // Dag-evenwichts-PWM bijleren (6aug26): enkel tijdens een echt
         // stabiele REGIME - zie de Photon-sketch voor de volledige uitleg.
@@ -419,15 +426,18 @@ function collectAndCheck() {
         // uitleg - de eerste EARLY_START_SETTLE_MINUTES wordt nog niets
         // herberekend, earlyStartPwmTarget blijft op de startwaarde staan.
         if (minutesSinceStart > EARLY_START_SETTLE_MINUTES) {
-          if (dTFiltered <= DT_HARD_STOP) {
-            earlyStartPwmTarget = EARLY_START_PWM_MIN;
-          } else if (earlyStartUsingEquilibrium) {
-            if (earlyStartPwmTarget < equilibriumPwm) {
+          if (earlyStartUsingEquilibrium) {
+            // Dag-evenwicht-modus (8aug26 PID24: dT<=0-veiligheid enkel hier).
+            if (dTFiltered <= DT_HARD_STOP) {
+              earlyStartPwmTarget = EARLY_START_PWM_MIN;
+            } else if (earlyStartPwmTarget < equilibriumPwm) {
               earlyStartPwmTarget = Math.min(equilibriumPwm, earlyStartPwmTarget + EARLY_START_CLIMB_STEP);
             } else if (dTFiltered > DT_TARGET + EQUILIBRIUM_CREEP_DT_HIGH) {
               earlyStartPwmTarget = Math.min(EARLY_START_PWM_MAX, earlyStartPwmTarget + EQUILIBRIUM_CREEP_PWM_STEP);
             }
           } else {
+            // Bootstrap (8aug26 PID24: onvoorwaardelijk, geen dT<=0-afkap meer -
+            // zie de Photon-sketch voor de uitleg).
             var liveFrac = (earlyStartCurrentGradient - EARLY_START_GRADIENT_MIN) /
                            (EARLY_START_GRADIENT_REF - EARLY_START_GRADIENT_MIN);
             liveFrac = Math.min(Math.max(liveFrac, 0), 1);
