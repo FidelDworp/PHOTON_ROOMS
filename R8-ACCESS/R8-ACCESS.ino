@@ -1,5 +1,8 @@
 // -R8-ACCESS.ino = Exterior lights control based on PIR sensors, with manual override.
 //
+// 6nov26: Variable JSON_status for the Zarlar Dashboard (via Worker /sensor):
+//         mw1/mw2/ms = motion in the last 10 min, lw1/lw2/ls = light on, au = automatic (PIR).
+//         Light logic and Manual commands unchanged. E and N left out (move to ACCESS2/3).
 // 3nov25: Remove homebridge commands,
 // 21oct23: Improved with ChatGPT's help: Added timer
 //
@@ -35,6 +38,27 @@ unsigned long lightStartTimeW2 = 0;
 unsigned long lightStartTimeS = 0;
 int autoLightDuration = 30000; // 30 seconds
 
+// 6nov26: status for the Dashboard (Particle variable JSON_status, read by the Worker /sensor)
+char JSON_status[100] = "{}";
+const unsigned long MOTION_RECENT = 600000; // 10 min: "recent motion" (Dashboard polls every ~9 min)
+unsigned long lastMotionW1 = 0, lastMotionW2 = 0, lastMotionS = 0;
+bool seenW1 = false, seenW2 = false, seenS = false; // motion seen since boot
+unsigned long lastStatus = 0;
+
+int recent(bool seen, unsigned long last, unsigned long now)
+{
+  return (seen && now - last < MOTION_RECENT) ? 1 : 0;
+}
+
+void updateStatus(unsigned long now) // outputs are active LOW: LOW = light on
+{
+  snprintf(JSON_status, sizeof(JSON_status),
+    "{\"mw1\":%d,\"mw2\":%d,\"ms\":%d,\"lw1\":%d,\"lw2\":%d,\"ls\":%d,\"au\":%d}",
+    recent(seenW1, lastMotionW1, now), recent(seenW2, lastMotionW2, now), recent(seenS, lastMotionS, now),
+    digitalRead(A5) == LOW ? 1 : 0, digitalRead(A4) == LOW ? 1 : 0, digitalRead(A6) == LOW ? 1 : 0,
+    automatic ? 1 : 0);
+}
+
 
 void setup()
 {
@@ -64,12 +88,21 @@ void setup()
 
   // GENERAL Particle functions:
   Particle.function("Manual", manual);
+  Particle.variable("JSON_status", JSON_status); // 6nov26
+  updateStatus(millis());
 }
 
 
 
 void loop()
 {
+  // 6nov26: remember motion for the status (also in manual mode; switches nothing)
+  unsigned long now = millis();
+  if (digitalRead(D3) == HIGH) { lastMotionW1 = now; seenW1 = true; }
+  if (digitalRead(D5) == HIGH) { lastMotionW2 = now; seenW2 = true; }
+  if (digitalRead(A7) == HIGH) { lastMotionS  = now; seenS  = true; }
+  if (now - lastStatus >= 2000) { lastStatus = now; updateStatus(now); }
+
   if (automatic) // PIR sensed lights control
   {
     if (digitalRead(D3) == HIGH) // Motion detected MOV-W1
